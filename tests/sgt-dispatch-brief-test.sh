@@ -383,6 +383,7 @@ assert_contains "at most one repository-required full suite"
 assert_not_contains "full required suite once at the end"
 assert_contains "Never run no-mistakes from this agent process"
 assert_contains '.sergeant-validation-ready'
+assert_contains 'readiness_review=passed'
 assert_contains 'sgt-validate'
 assert_contains "without \`--yes\`"
 assert_not_contains "An explicit user instruction to run no-mistakes overrides this default"
@@ -415,6 +416,7 @@ assert_contains "Do not rerun the repository full suite or every independent rev
 assert_not_contains "rerun all required independent review axes"
 assert_contains "blocking findings remain zero"
 assert_contains "default medium profile"
+assert_contains "bounded Standards/Spec review pass completed"
 assert_contains "does not attest that an unconditional standalone readiness-risk review ran"
 assert_contains "no repeated no-mistakes cycles"
 assert_contains "required CI is green"
@@ -623,6 +625,19 @@ SERGEANT_FLEET="$TEST_ROOT/fleet" \
 SGT_WIKI_DISABLED=1 \
   "$ROOT_DIR/bin/sgt-dispatch" test "$policy_mission" --repos app >/dev/null
 brief="$(grep -rl "^${policy_mission}$" "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
+assert_not_contains "Accessibility axis"
+
+write_routing_config "Backend service" "product" "Internal services" "Maintain deployment automation"
+wrapped_policy_mission="Document wrapped backend review policy:
+accessibility review applies
+  only to UI-facing changes"
+PATH="$TEST_ROOT/fake-bin:$PATH" \
+SERGEANT_CONFIG="$TEST_ROOT/config" \
+SERGEANT_FLEET="$TEST_ROOT/fleet" \
+SGT_WIKI_DISABLED=1 \
+  "$ROOT_DIR/bin/sgt-dispatch" test "$wrapped_policy_mission" --repos app >/dev/null
+brief="$(grep -rlF "Document wrapped backend review policy:" "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
+[[ -n "$brief" ]] || { printf 'wrapped policy brief was not generated\n' >&2; exit 1; }
 assert_not_contains "Accessibility axis"
 
 for repo_name in role-ui group-ui; do

@@ -715,7 +715,8 @@ $td_context_block"
 
   review_axis_label="two"
   accessibility_axis_markdown=""
-  review_context="$(printf '%s %s %s %s %s' "$BRIEF" "$repo_role" "$repo_group" "$group_description" "$merged" | tr '[:upper:]' '[:lower:]')"
+  review_context="$(printf '%s %s %s %s %s' "$BRIEF" "$repo_role" "$repo_group" "$group_description" "$merged" \
+    | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
   # Conditional review-policy prose describes routing, not UI work itself.
   for review_policy_phrase in \
     "accessibility review only for ui-facing changes" \

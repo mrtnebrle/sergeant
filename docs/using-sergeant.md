@@ -247,6 +247,10 @@ writes `.sergeant-validation-ready` with the recorded `intent_revision`, current
 `readiness_review`, then notifies the coordinator. The worker must
 not run no-mistakes. The coordinator starts the one final validation boundary:
 
+Here `readiness_review=passed` attests that the bounded Standards/Spec review pass
+and every risk review required by active repository or task policy completed. It
+does not attest that an unconditional standalone readiness-risk review ran.
+
 ```bash
 sgt-validate <fleet-task-id> <repo> [--skip <steps>]
 ```

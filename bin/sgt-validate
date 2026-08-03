@@ -47,13 +47,15 @@ STANDARDS_REVIEW="$(_ready_field standards_review "$WORKTREE/.sergeant-validatio
   _die "validation-ready marker has incomplete HEAD or review evidence"
 SPEC_REVIEW="$(_ready_field spec_review "$WORKTREE/.sergeant-validation-ready")" || \
   _die "validation-ready marker has incomplete HEAD or review evidence"
-READINESS_REVIEW="$(_ready_field readiness_review "$WORKTREE/.sergeant-validation-ready")" || \
+# The persisted readiness_review field attests that the bounded Standards/Spec review pass
+# and every policy-required risk review completed. It does not attest that an unconditional standalone readiness-risk review ran.
+BOUNDED_READINESS_REVIEW="$(_ready_field readiness_review "$WORKTREE/.sergeant-validation-ready")" || \
   _die "validation-ready marker has incomplete HEAD or review evidence"
 CURRENT_HEAD="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)"
 [[ "$READY_INTENT" == "$EXPECTED_REVISION" ]] || \
   _die "validation-ready marker does not match the canonical intent revision"
 [[ "$READY_HEAD" == "$CURRENT_HEAD" && "$STANDARDS_REVIEW" == "passed" && \
-   "$SPEC_REVIEW" == "passed" && "$READINESS_REVIEW" == "passed" ]] || \
+   "$SPEC_REVIEW" == "passed" && "$BOUNDED_READINESS_REVIEW" == "passed" ]] || \
   _die "validation-ready marker has stale HEAD or review evidence"
 _sgt_worktree_is_validation_clean "$WORKTREE" || \
   _die "Worker code tree must be clean before validation snapshot"

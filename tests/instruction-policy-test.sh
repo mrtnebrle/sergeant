@@ -90,6 +90,19 @@ reject_text "skills/dispatch/SKILL.md" "After two remediation cycles"
 reject_text "skills/dispatch/SKILL.md" "rerun affected tests and all required axes"
 require_text "skills/dispatch/SKILL.md" "findings with the same originating run, head, owning module, and root cause share one serialized remediation worker and branch"
 require_text "skills/dispatch/SKILL.md" "If remediation reaches a second cycle, stop fix dispatch and require architectural/root-cause review plus a human decision"
+grouped_remediation_count="$(grep -Fc 'Before merging grouped remediation' "$repo_root/skills/dispatch/SKILL.md" || true)"
+[[ "$grouped_remediation_count" == "1" ]] || \
+  fail "skills/dispatch/SKILL.md must define exactly one grouped remediation rereview contract"
+grouped_remediation_policy="$(grep -F 'Before merging grouped remediation' "$repo_root/skills/dispatch/SKILL.md" || true)"
+case "$grouped_remediation_policy" in
+  *"rerun only affected native tests and independent review checks"*"risk review only when active repository or task policy explicitly requires it"*) ;;
+  *) fail "skills/dispatch/SKILL.md grouped remediation must keep rereviews affected-only and risk review policy-conditional" ;;
+esac
+for readiness_contract_file in bin/sgt-dispatch bin/sgt-validate docs/using-sergeant.md; do
+  require_text "$readiness_contract_file" "bounded Standards/Spec review pass"
+  require_text "$readiness_contract_file" "does not attest that an unconditional standalone readiness-risk review ran"
+done
+require_text "bin/sgt-validate" '_ready_field readiness_review'
 require_text "docs/using-sergeant.md" '--intent-file intent.md'
 require_text "docs/using-sergeant.md" ".sergeant-intent.md"
 reject_text "AGENTS.md" 'no-mistakes axi run --intent "<the user'
