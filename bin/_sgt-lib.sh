@@ -152,6 +152,61 @@ _sgt_path_mode() {
 _sgt_fd_mode() {
   stat -L -c '%a' -- "$1" 2>/dev/null || stat -L -f '%Lp' "$1" 2>/dev/null
 }
+_sgt_fd_mode_matches_path() {
+  local fd_mode="$1" path_mode="$2" system
+  [[ "$fd_mode" == "$path_mode" ]] && return 0
+  system="$(uname -s 2>/dev/null)" || return 1
+  [[ "$system" == "Darwin" ]] || return 1
+  case "$path_mode:$fd_mode" in
+    600:400|640:440|644:444|660:440|664:444) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_sgt_path_identity() {
+  stat -c '%u:%d:%i' -- "$1" 2>/dev/null || stat -f '%u:%d:%i' "$1" 2>/dev/null
+}
+_sgt_fd_identity() {
+  local fd_path="$1" fd_number system
+  system="$(uname -s 2>/dev/null)" || return 1
+  if [[ "$system" == "Darwin" ]]; then
+    fd_number="${fd_path#/dev/fd/}"
+    [[ "$fd_path" == "/dev/fd/$fd_number" ]] || return 1
+    case "$fd_number" in
+      ""|*[!0-9]*) return 1 ;;
+    esac
+    python3 -c 'import os,sys; s=os.fstat(int(sys.argv[1])); print("%d:%d:%d" % (s.st_uid,s.st_dev,s.st_ino))' \
+      "$fd_number" 2>/dev/null
+    return
+  fi
+  stat -L -c '%u:%d:%i' -- "$fd_path" 2>/dev/null || \
+    stat -L -f '%u:%d:%i' "$fd_path" 2>/dev/null
+}
+_sgt_fd_matches_path() {
+  local path="$1" fd_path="$2" path_identity="$3" system fd_identity
+  fd_identity="$(_sgt_fd_identity "$fd_path")" || return 1
+  [[ "${path_identity%%:*}" == "$EUID" && "${fd_identity%%:*}" == "$EUID" ]] || return 1
+  system="$(uname -s 2>/dev/null)" || return 1
+  if [[ "$system" != "Darwin" ]]; then
+    [[ "$path" -ef "$fd_path" ]]
+    return
+  fi
+  # Darwin's fdescfs gives /dev/fd entries a synthetic device ID, but retains
+  # the descriptor's real identity is available through fstat(2).
+  [[ "$path_identity" == "$fd_identity" ]]
+}
+_sgt_owned_fd_matches_path() {
+  local path="$1" fd_path="$2" expected_mode="$3" expected_identity="$4"
+  local fd_mode current_mode current_identity
+  fd_mode="$(_sgt_fd_mode "$fd_path")" || return 1
+  current_mode="$(_sgt_path_mode "$path")" || return 1
+  _sgt_fd_mode_matches_path "$fd_mode" "$expected_mode" || return 1
+  [[ "$current_mode" == "$expected_mode" && -f "$fd_path" && -O "$fd_path" && \
+    -f "$path" && ! -L "$path" && -O "$path" ]] || \
+    return 1
+  current_identity="$(_sgt_path_identity "$path")" || return 1
+  [[ "$current_identity" == "$expected_identity" ]] || return 1
+  _sgt_fd_matches_path "$path" "$fd_path" "$current_identity"
+}
 _sgt_legacy_identity_mode() {
   case "$1" in
     640|644|660|664) return 0 ;;
@@ -159,27 +214,19 @@ _sgt_legacy_identity_mode() {
   esac
 }
 _sgt_read_owned_file() {
-  local path="$1" mode fd_mode value
+  local path="$1" expected_identity="${2:-}" mode identity value
   [[ -f "$path" && ! -L "$path" && -O "$path" ]] || return 1
   mode="$(_sgt_path_mode "$path")" || return 1
   [[ "$mode" == "600" ]] || return 1
+  identity="$(_sgt_path_identity "$path")" || return 1
+  [[ -z "$expected_identity" || "$identity" == "$expected_identity" ]] || return 1
   exec 9< "$path" || return 1
-  fd_mode="$(_sgt_fd_mode /dev/fd/9)" || {
-    exec 9<&-
-    return 1
-  }
-  if [[ "$fd_mode" != "600" || ! -f /dev/fd/9 || ! -O /dev/fd/9 || \
-    ! -f "$path" || -L "$path" || ! -O "$path" || ! "$path" -ef /dev/fd/9 ]]; then
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 "$mode" "$identity"; then
     exec 9<&-
     return 1
   fi
   value="$(cat <&9)" || { exec 9<&-; return 1; }
-  fd_mode="$(_sgt_fd_mode /dev/fd/9)" || {
-    exec 9<&-
-    return 1
-  }
-  if [[ "$fd_mode" != "600" || ! -O /dev/fd/9 || -L "$path" || \
-    ! "$path" -ef /dev/fd/9 ]]; then
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 "$mode" "$identity"; then
     exec 9<&-
     return 1
   fi
@@ -187,88 +234,69 @@ _sgt_read_owned_file() {
   printf '%s\n' "$value"
 }
 _sgt_read_matching_legacy_pane_identity() {
-  local path="$1" actual="$2" mode fd_mode value migrated candidate current_mode
+  local path="$1" actual="$2" mode identity value migrated
   [[ -n "$actual" ]] || return 1
   [[ -f "$path" && ! -L "$path" && -O "$path" ]] || return 1
   mode="$(_sgt_path_mode "$path")" || return 1
   _sgt_legacy_identity_mode "$mode" || return 1
+  identity="$(_sgt_path_identity "$path")" || return 1
   exec 9< "$path" || return 1
-  fd_mode="$(_sgt_fd_mode /dev/fd/9)" || {
-    exec 9<&-
-    return 1
-  }
-  if [[ "$fd_mode" != "$mode" || ! -f /dev/fd/9 || ! -O /dev/fd/9 || \
-    ! -f "$path" || -L "$path" || ! -O "$path" || ! "$path" -ef /dev/fd/9 ]]; then
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 "$mode" "$identity"; then
     exec 9<&-
     return 1
   fi
   value="$(cat <&9)" || { exec 9<&-; return 1; }
   [[ "$value" == "$actual" ]] || { exec 9<&-; return 1; }
-  candidate="${path}.tmp.$$.$RANDOM.$RANDOM"
-  (umask 077; set -C; printf '%s\n' "$value" > "$candidate") 2>/dev/null || {
-    exec 9<&-
-    return 1
-  }
-  chmod 600 "$candidate" || {
-    rm -f "$candidate"
-    exec 9<&-
-    return 1
-  }
-  current_mode="$(_sgt_path_mode "$path")" || {
-    rm -f "$candidate"
-    exec 9<&-
-    return 1
-  }
-  fd_mode="$(_sgt_fd_mode /dev/fd/9)" || {
-    rm -f "$candidate"
-    exec 9<&-
-    return 1
-  }
-  if [[ "$current_mode" != "$mode" || "$fd_mode" != "$mode" || \
-    ! -f /dev/fd/9 || ! -O /dev/fd/9 || \
-    ! -f "$path" || -L "$path" || ! -O "$path" || ! "$path" -ef /dev/fd/9 ]]; then
-    rm -f "$candidate"
+  if ! chmod 600 /dev/fd/9; then
     exec 9<&-
     return 1
   fi
-  mv "$candidate" "$path" || {
-    rm -f "$candidate"
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 600 "$identity"; then
     exec 9<&-
     return 1
-  }
-  exec 9<&-
-  migrated="$(_sgt_read_owned_file "$path" 2>/dev/null || true)"
+  fi
+  exec 8< "$path" || { exec 9<&-; return 1; }
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/8 600 "$identity" || \
+    ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 600 "$identity" || \
+    [[ ! /dev/fd/8 -ef /dev/fd/9 ]]; then
+    exec 8<&- 9<&-
+    return 1
+  fi
+  migrated="$(cat <&8)" || { exec 8<&- 9<&-; return 1; }
+  if ! _sgt_owned_fd_matches_path "$path" /dev/fd/8 600 "$identity" || \
+    ! _sgt_owned_fd_matches_path "$path" /dev/fd/9 600 "$identity" || \
+    [[ ! /dev/fd/8 -ef /dev/fd/9 ]]; then
+    exec 8<&- 9<&-
+    return 1
+  fi
+  exec 8<&- 9<&-
   [[ "$migrated" == "$actual" ]] || return 1
   printf '%s\n' "$migrated"
 }
 _sgt_read_same_owned_files() {
-  local first="$1" second="$2" first_mode second_mode first_fd_mode second_fd_mode
+  local first="$1" second="$2" first_mode second_mode first_identity second_identity
   local first_value second_value
   [[ -f "$first" && ! -L "$first" && -O "$first" && \
     -f "$second" && ! -L "$second" && -O "$second" ]] || return 1
   first_mode="$(_sgt_path_mode "$first")" || return 1
   second_mode="$(_sgt_path_mode "$second")" || return 1
   [[ "$first_mode" == "600" && "$second_mode" == "600" ]] || return 1
+  first_identity="$(_sgt_path_identity "$first")" || return 1
+  second_identity="$(_sgt_path_identity "$second")" || return 1
+  [[ "$first_identity" == "$second_identity" ]] || return 1
   exec 8< "$first" || return 1
   exec 9< "$second" || { exec 8<&-; return 1; }
-  first_fd_mode="$(_sgt_fd_mode /dev/fd/8)"
-  second_fd_mode="$(_sgt_fd_mode /dev/fd/9)"
-  if [[ "$first_fd_mode" != "600" || "$second_fd_mode" != "600" || \
-    ! -f /dev/fd/8 || ! -f /dev/fd/9 || ! -O /dev/fd/8 || ! -O /dev/fd/9 || \
-    ! "$first" -ef /dev/fd/8 || ! "$second" -ef /dev/fd/9 || \
-    ! /dev/fd/8 -ef /dev/fd/9 || -L "$first" || -L "$second" ]]; then
+  if ! _sgt_owned_fd_matches_path "$first" /dev/fd/8 "$first_mode" "$first_identity" || \
+    ! _sgt_owned_fd_matches_path "$second" /dev/fd/9 "$second_mode" "$second_identity" || \
+    [[ ! /dev/fd/8 -ef /dev/fd/9 ]]; then
     exec 8<&- 9<&-
     return 1
   fi
   first_value="$(cat <&8)" || { exec 8<&- 9<&-; return 1; }
   second_value="$(cat <&9)" || { exec 8<&- 9<&-; return 1; }
-  first_fd_mode="$(_sgt_fd_mode /dev/fd/8)"
-  second_fd_mode="$(_sgt_fd_mode /dev/fd/9)"
-  if [[ "$first_fd_mode" != "600" || "$second_fd_mode" != "600" || \
-    ! -f /dev/fd/8 || ! -f /dev/fd/9 || ! -O /dev/fd/8 || ! -O /dev/fd/9 || \
-    -L "$first" || -L "$second" || \
-    ! "$first" -ef /dev/fd/8 || ! "$second" -ef /dev/fd/9 || \
-    ! /dev/fd/8 -ef /dev/fd/9 ]]; then
+  if ! _sgt_owned_fd_matches_path "$first" /dev/fd/8 "$first_mode" "$first_identity" || \
+    ! _sgt_owned_fd_matches_path "$second" /dev/fd/9 "$second_mode" "$second_identity" || \
+    [[ ! /dev/fd/8 -ef /dev/fd/9 ]]; then
     exec 8<&- 9<&-
     return 1
   fi

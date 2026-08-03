@@ -153,6 +153,11 @@ real_ln="$(command -v ln)"
 real_rm="$(command -v rm)"
 real_stat="$(command -v stat)"
 real_shasum="$(command -v shasum || command -v sha256sum)"
+if "$real_stat" -c '%a' -- "$fleet/task-1/primary_pane_identity" >/dev/null 2>&1; then
+  path_mode_format='%a'
+else
+  path_mode_format='%Lp'
+fi
 validation_path="${worktree}-validation-task-1"
 concurrent_dir="$TEST_ROOT/concurrent"
 mkdir -p "$concurrent_dir"
@@ -160,6 +165,7 @@ export REAL_GIT="$real_git" REAL_CP="$real_cp" REAL_MV="$real_mv" REAL_LN="$real
 export REAL_RM="$real_rm"
 export REAL_CHMOD="$real_chmod"
 export REAL_STAT="$real_stat"
+export TEST_PATH_MODE_FORMAT="$path_mode_format"
 export REAL_SHASUM="$real_shasum" VALIDATION_PATH="$validation_path"
 export CONCURRENT_DIR="$concurrent_dir" TEST_REPO_STATE="$repo_state"
 printf '%s\n' "$revision" > "$concurrent_dir/revision"
@@ -305,14 +311,15 @@ if [[ "${FAIL_TRANSITION:-}" == "identity-chmod-race" && \
   chmod 644 "$last"
   exit 0
 fi
-if [[ "$last" == */primary_pane_identity && -n "${IDENTITY_RACE_MARKER:-}" && \
+if [[ "$last" == */primary_pane_identity && "$*" == *"$TEST_PATH_MODE_FORMAT"* && \
+  -n "${IDENTITY_RACE_MARKER:-}" && \
   "${FAIL_TRANSITION:-}" == @(legacy-identity-content-race|legacy-identity-publish-replaced) ]]; then
   count_file="${IDENTITY_RACE_MARKER}.count"
   count=0
   [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
   count=$((count + 1))
   printf '%s\n' "$count" > "$count_file"
-  if [[ "$count" -eq 3 ]]; then
+  if [[ "$count" -eq 4 ]]; then
     case "${FAIL_TRANSITION:-}" in
       legacy-identity-content-race)
         printf 'tampered-pane\n' > "$last"
@@ -794,15 +801,21 @@ done
 
 legacy_race_marker="$TEST_ROOT/legacy-pane-race"
 chmod 664 "$fleet/task-1/primary_pane_identity"
-PATH="$fake_bin:$PATH" TMUX_LOG="$TEST_ROOT/tmux.log" \
+set +e
+output="$(PATH="$fake_bin:$PATH" TMUX_LOG="$TEST_ROOT/tmux.log" \
   FAIL_TRANSITION=legacy-identity-content-race IDENTITY_RACE_MARKER="$legacy_race_marker" \
   TMUX_PANE=%11 SERGEANT_FLEET="$fleet" \
-  "$ROOT_DIR/bin/sgt-validate" task-1 app >/dev/null
-[[ "$(cat "$fleet/task-1/primary_pane_identity")" == '0|%11|1111|111111|coordinator-command' ]]
+  "$ROOT_DIR/bin/sgt-validate" task-1 app 2>&1)"
+status=$?
+set -e
+[[ "$status" -ne 0 ]]
+[[ "$(cat "$fleet/task-1/primary_pane_identity")" == 'tampered-pane' ]]
 [[ "$(stat -c '%a' "$fleet/task-1/primary_pane_identity" 2>/dev/null || \
-  stat -f '%Lp' "$fleet/task-1/primary_pane_identity")" == "600" ]]
+  stat -f '%Lp' "$fleet/task-1/primary_pane_identity")" == "664" ]]
 [[ -e "$legacy_race_marker" ]]
 cleanup_validation_state
+printf '0|%%11|1111|111111|coordinator-command\n' > "$fleet/task-1/primary_pane_identity"
+chmod 600 "$fleet/task-1/primary_pane_identity"
 
 legacy_replace_marker="$TEST_ROOT/legacy-pane-replaced"
 chmod 664 "$fleet/task-1/primary_pane_identity"
