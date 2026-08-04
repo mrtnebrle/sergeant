@@ -59,6 +59,7 @@ chmod +x "$TEST_ROOT/fake-bin/yq"
 cat > "$TEST_ROOT/fake-bin/mv" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$(basename "$2")" >> "$MV_LOG"
+[[ -z "${MV_FAIL_TARGET:-}" || "$(basename "$2")" != "$MV_FAIL_TARGET" ]] || exit 18
 PATH=/usr/bin:/bin
 exec mv "$@"
 EOF
@@ -136,6 +137,7 @@ run_router() {
     RETRY_PATH="${RETRY_PATH:-$WORKTREE/.sergeant-review-retries/standards-code-review.json}" \
     RETRY_REPLACED_MARKER="${RETRY_REPLACED_MARKER:-$TEST_ROOT/retry-replaced}" \
     NOTIFY_FAIL="${NOTIFY_FAIL:-0}" \
+    MV_FAIL_TARGET="${MV_FAIL_TARGET:-}" \
     "$INSTALLED_BIN/sgt-review-findings" test app \
       --input "$1" --axis "${ROUTER_AXIS:-standards}" --source code-review \
       --branch fix/review --head-sha abc1234 --parent-task td-parent \
@@ -412,6 +414,14 @@ retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
 [[ "$output" == *"$retry_path"* ]]
 grep -Fq "$retry_path" "$WORKTREE/.sergeant-message"
 
+MV_FAIL_TARGET=.sergeant-message run_router "$TEST_ROOT/findings.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+[[ "$status" -eq 2 && "$output" == *'failed to publish blocking review findings'* ]] || {
+  printf 'blocking state-write failure bypassed retry retention: status=%s output=%s\n' "$status" "$output" >&2
+  exit 1
+}
+[[ -f "$retry_path" && "$output" == *"$retry_path"* ]]
+
 outside_retry_dir="$TEST_ROOT/outside-retries"
 rm -rf "$WORKTREE/.sergeant-review-retries"
 mkdir -p "$outside_retry_dir"
@@ -449,6 +459,15 @@ grep -Fq 'Review finding routing failed' "$WORKTREE/.sergeant-message"
 printf '{"findings":[]}\n' > "$TEST_ROOT/clean.json"
 PRESERVE_FLEET=1 run_router "$TEST_ROOT/clean.json"
 [[ "$(cat "$WORKTREE/.sergeant-status")" == 'in_progress' && ! -e "$WORKTREE/.sergeant-message" ]]
+
+run_router "$TEST_ROOT/findings.json"
+MV_FAIL_TARGET=.sergeant-status PRESERVE_FLEET=1 run_router "$TEST_ROOT/clean.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+[[ "$status" -eq 2 && "$output" == *'failed to update review gate state'* ]] || {
+  printf 'nonblocking state-write failure bypassed retry retention: status=%s output=%s\n' "$status" "$output" >&2
+  exit 1
+}
+[[ -f "$retry_path" && "$output" == *"$retry_path"* ]]
 
 run_router "$TEST_ROOT/findings.json"
 PRESERVE_FLEET=1 ROUTER_AXIS=spec run_router "$TEST_ROOT/findings.json"

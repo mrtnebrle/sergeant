@@ -63,7 +63,7 @@ _review_gate_messages() {
   local gate
   for gate in "$WORKTREE/.sergeant-review-gates"/*; do
     [[ -f "$gate" ]] || continue
-    tail -n +2 "$gate"
+    tail -n +2 "$gate" || return 1
   done
 }
 
@@ -74,22 +74,34 @@ _publish_blocked() {
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
   generation=$((current + 1))
   if _valid_review_context; then
-    mkdir -p "$WORKTREE/.sergeant-review-gates"
+    if ! mkdir -p "$WORKTREE/.sergeant-review-gates"; then
+      _sgt_response_lock_release || true
+      return 1
+    fi
     gate_path="$(_review_gate_path)"
-    printf '%s\n%s\n' "$generation" "$message" > "$gate_path.tmp"
-    mv "$gate_path.tmp" "$gate_path"
-    message="$(_review_gate_messages)"
+    if ! printf '%s\n%s\n' "$generation" "$message" > "$gate_path.tmp" ||
+       ! mv "$gate_path.tmp" "$gate_path" ||
+       ! message="$(_review_gate_messages)"; then
+      _sgt_response_lock_release || true
+      return 1
+    fi
   fi
-  printf '%s\n' "$message" > "$WORKTREE/.sergeant-message.tmp"
-  printf '%s\n' "$generation" > "$WORKTREE/.sergeant-gate-generation.tmp"
-  printf 'blocked\n' > "$WORKTREE/.sergeant-status.tmp"
-  mv "$WORKTREE/.sergeant-gate-generation.tmp" "$WORKTREE/.sergeant-gate-generation"
-  mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"
+  if ! printf '%s\n' "$message" > "$WORKTREE/.sergeant-message.tmp" ||
+     ! printf '%s\n' "$generation" > "$WORKTREE/.sergeant-gate-generation.tmp" ||
+     ! printf 'blocked\n' > "$WORKTREE/.sergeant-status.tmp" ||
+     ! mv "$WORKTREE/.sergeant-gate-generation.tmp" "$WORKTREE/.sergeant-gate-generation" ||
+     ! mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"; then
+    _sgt_response_lock_release || true
+    return 1
+  fi
   notify_status=0
   if _valid_fleet_task_id "$TASK_ID"; then
     "$SCRIPT_DIR/sgt-notify" "$TASK_ID" "blocked [$REPO]: $notice" >/dev/null 2>&1 || notify_status=$?
   fi
-  mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
+  if ! mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"; then
+    _sgt_response_lock_release || true
+    return 1
+  fi
   _sgt_response_lock_release || return 1
   if (( notify_status != 0 )); then
     printf 'ERROR: sgt-notify failed while publishing blocked review findings\n' >&2
@@ -185,7 +197,7 @@ _cleanup_router_temporaries() {
 }
 
 _routing_failure() {
-  local reason="$1" routed="none" remediation="retry the router" retry_note="No sanitized retry artifact was available."
+  local reason="$1" publish_blocked="${2:-1}" routed="none" remediation="retry the router" retry_note="No sanitized retry artifact was available."
   if (( ${#routed_task_ids[@]} > 0 )); then
     routed="$(IFS=', '; printf '%s' "${routed_task_ids[*]}")"
     remediation="$(IFS='; '; printf '%s' "${routed_recommendations[*]}")"
@@ -193,12 +205,22 @@ _routing_failure() {
   if _preserve_retry_artifact; then
     retry_note="Sanitized retry artifact: $retry_path."
   fi
-  _publish_blocked \
-    "Review finding routing failed. Routed TD tasks: $routed. Recommended remediation: $remediation. $retry_note Retry sgt-review-findings after correcting the structured artifact or td failure." \
-    "review finding routing failed; routed td tasks: $routed" || true
+  if [[ "$publish_blocked" == "1" ]]; then
+    _publish_blocked \
+      "Review finding routing failed. Routed TD tasks: $routed. Recommended remediation: $remediation. $retry_note Retry sgt-review-findings after correcting the structured artifact or td failure." \
+      "review finding routing failed; routed td tasks: $routed" || true
+  fi
   printf 'ERROR: %s\n' "$reason" >&2
   [[ "$retry_note" != "No sanitized retry artifact was available." ]] && printf 'Retry artifact: %s\n' "$retry_path" >&2
   exit 2
+}
+
+_review_gate_routing_failure() {
+  local reason="$1"
+  if _sgt_response_lock_release; then
+    _routing_failure "$reason"
+  fi
+  _routing_failure "$reason" 0
 }
 
 for required in INPUT AXIS SOURCE BRANCH HEAD_SHA PARENT_TASK; do
@@ -456,9 +478,14 @@ done
 if (( ${#blocking_tasks[@]} > 0 )); then
   task_list="$(IFS=', '; printf '%s' "${blocking_tasks[*]}")"
   remediation_list="$(IFS='; '; printf '%s' "${blocking_recommendations[*]}")"
-  if ! _publish_blocked \
+  publish_status=0
+  _publish_blocked \
     "Independent review requires remediation. Review axis: $AXIS. Review source: $SOURCE. TD tasks: $task_list. Recommended remediation: $remediation_list" \
-    "independent review requires remediation; td tasks: $task_list"; then
+    "independent review requires remediation; td tasks: $task_list" || publish_status=$?
+  if (( publish_status != 0 )); then
+    if (( publish_status == 1 )); then
+      _routing_failure "failed to publish blocking review findings" 0
+    fi
     _routing_failure "failed to publish blocking review findings"
   fi
   _complete_routing || _routing_failure "failed to consume retry artifact"
@@ -475,16 +502,21 @@ if [[ -f "$gate_path" ]]; then
   IFS= read -r current_gate_generation < "$gate_path" || true
 fi
 if [[ -n "$invocation_gate_generation" && "$current_gate_generation" == "$invocation_gate_generation" ]]; then
-  rm -f "$gate_path"
-  remaining_message="$(_review_gate_messages)"
+  rm -f "$gate_path" || _review_gate_routing_failure "failed to update review gate state"
+  remaining_message="$(_review_gate_messages)" || _review_gate_routing_failure "failed to update review gate state"
   if [[ -n "$remaining_message" ]]; then
-    printf '%s\n' "$remaining_message" > "$WORKTREE/.sergeant-message.tmp"
-    mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"
+    printf '%s\n' "$remaining_message" > "$WORKTREE/.sergeant-message.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
   elif [[ "$current_generation" == "$invocation_generation" && "$current_status" == "blocked" ]] &&
        [[ "$current_message" == "Independent review requires remediation."* || "$current_message" == "Review finding routing failed."* ]]; then
-    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp"
-    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
-    rm -f "$WORKTREE/.sergeant-message"
+    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    rm -f "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
     rmdir "$WORKTREE/.sergeant-review-gates" 2>/dev/null || true
   fi
 elif [[ -z "$invocation_gate_generation" && -z "$current_gate_generation" &&
@@ -498,12 +530,17 @@ elif [[ -z "$invocation_gate_generation" && -z "$current_gate_generation" &&
     [[ -f "$_g" ]] && other_axis_gate=true && break
   done
   if [[ "$other_axis_gate" == false ]]; then
-    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp"
-    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
-    rm -f "$WORKTREE/.sergeant-message"
+    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    rm -f "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
   fi
 fi
-_sgt_response_lock_release || _routing_failure "could not unlock review gate state"
+if ! _sgt_response_lock_release; then
+  _routing_failure "could not unlock review gate state" 0
+fi
 
 _complete_routing || _routing_failure "failed to consume retry artifact"
 
