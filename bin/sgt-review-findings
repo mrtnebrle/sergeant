@@ -14,6 +14,11 @@ usage() {
 Usage: sgt-review-findings <project> <repo> --input <json> --axis <axis> --source <source>
   --branch <branch> --head-sha <sha> --parent-task <id> --task-id <fleet-id>
   --worktree <path>
+
+Axes: standards, spec, accessibility, readiness.
+Severities: error, warning, info, informational; high, medium, and low normalize
+to error, warning, and info. A routing failure reports a sanitized retry artifact
+under <worktree>/.sergeant-review-retries/; pass that path to --input to retry.
 EOF
   exit 1
 }
@@ -47,7 +52,7 @@ _valid_fleet_task_id() {
 }
 
 _valid_review_context() {
-  [[ "$AXIS" =~ ^(standards|spec|accessibility)$ ]] && [[ "$SOURCE" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "$AXIS" =~ ^(standards|spec|accessibility|readiness)$ ]] && [[ "$SOURCE" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
 _review_gate_path() {
@@ -58,7 +63,7 @@ _review_gate_messages() {
   local gate
   for gate in "$WORKTREE/.sergeant-review-gates"/*; do
     [[ -f "$gate" ]] || continue
-    tail -n +2 "$gate"
+    tail -n +2 "$gate" || return 1
   done
 }
 
@@ -69,22 +74,34 @@ _publish_blocked() {
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
   generation=$((current + 1))
   if _valid_review_context; then
-    mkdir -p "$WORKTREE/.sergeant-review-gates"
+    if ! mkdir -p "$WORKTREE/.sergeant-review-gates"; then
+      _sgt_response_lock_release || true
+      return 1
+    fi
     gate_path="$(_review_gate_path)"
-    printf '%s\n%s\n' "$generation" "$message" > "$gate_path.tmp"
-    mv "$gate_path.tmp" "$gate_path"
-    message="$(_review_gate_messages)"
+    if ! printf '%s\n%s\n' "$generation" "$message" > "$gate_path.tmp" ||
+       ! mv "$gate_path.tmp" "$gate_path" ||
+       ! message="$(_review_gate_messages)"; then
+      _sgt_response_lock_release || true
+      return 1
+    fi
   fi
-  printf '%s\n' "$message" > "$WORKTREE/.sergeant-message.tmp"
-  printf '%s\n' "$generation" > "$WORKTREE/.sergeant-gate-generation.tmp"
-  printf 'blocked\n' > "$WORKTREE/.sergeant-status.tmp"
-  mv "$WORKTREE/.sergeant-gate-generation.tmp" "$WORKTREE/.sergeant-gate-generation"
-  mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"
+  if ! printf '%s\n' "$message" > "$WORKTREE/.sergeant-message.tmp" ||
+     ! printf '%s\n' "$generation" > "$WORKTREE/.sergeant-gate-generation.tmp" ||
+     ! printf 'blocked\n' > "$WORKTREE/.sergeant-status.tmp" ||
+     ! mv "$WORKTREE/.sergeant-gate-generation.tmp" "$WORKTREE/.sergeant-gate-generation" ||
+     ! mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"; then
+    _sgt_response_lock_release || true
+    return 1
+  fi
   notify_status=0
   if _valid_fleet_task_id "$TASK_ID"; then
     "$SCRIPT_DIR/sgt-notify" "$TASK_ID" "blocked [$REPO]: $notice" >/dev/null 2>&1 || notify_status=$?
   fi
-  mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
+  if ! mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"; then
+    _sgt_response_lock_release || true
+    return 1
+  fi
   _sgt_response_lock_release || return 1
   if (( notify_status != 0 )); then
     printf 'ERROR: sgt-notify failed while publishing blocked review findings\n' >&2
@@ -94,18 +111,116 @@ _publish_blocked() {
 
 routed_task_ids=()
 routed_recommendations=()
+parsed=""
+retry_candidate=""
+retry_candidate_identity=""
+retry_dir=""
+retry_input_identity=""
+retry_path=""
+retry_ready=0
+
+_retry_directory_is_safe() {
+  [[ -d "$retry_dir" && ! -L "$retry_dir" ]]
+}
+
+_retry_destination_is_safe() {
+  [[ ! -e "$retry_path" && ! -L "$retry_path" ]] || [[ -f "$retry_path" && ! -L "$retry_path" ]]
+}
+
+_retry_candidate_is_safe() {
+  local current_identity
+  [[ -n "$retry_candidate" && -n "$retry_candidate_identity" && -f "$retry_candidate" && ! -L "$retry_candidate" ]] || return 1
+  current_identity="$(_sgt_path_identity "$retry_candidate" 2>/dev/null)" || return 1
+  [[ "$current_identity" == "$retry_candidate_identity" ]]
+}
+
+_prepare_retry_artifact() {
+  local status=0
+  _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
+  if [[ -L "$retry_dir" || ( -e "$retry_dir" && ! -d "$retry_dir" ) ]]; then
+    status=1
+  else
+    mkdir -p "$retry_dir" || status=$?
+    (( status != 0 )) || chmod 700 "$retry_dir" || status=$?
+    (( status != 0 )) || _retry_destination_is_safe || status=1
+    if (( status == 0 )); then
+      retry_candidate="$(mktemp "$retry_dir/.$AXIS-$SOURCE.json.tmp.XXXXXX")" || status=$?
+    fi
+    (( status != 0 )) || chmod 600 "$retry_candidate" || status=$?
+    if (( status == 0 )); then
+      retry_candidate_identity="$(_sgt_path_identity "$retry_candidate" 2>/dev/null)" || status=$?
+    fi
+  fi
+  _sgt_response_lock_release || status=$?
+  return "$status"
+}
+
+_preserve_retry_artifact() {
+  local status=0
+  [[ "$retry_ready" == "1" && -n "$retry_candidate" && -s "$retry_candidate" && -n "$retry_path" ]] || return 1
+  _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
+  _retry_directory_is_safe || status=1
+  (( status != 0 )) || _retry_destination_is_safe || status=1
+  (( status != 0 )) || _retry_candidate_is_safe || status=1
+  (( status != 0 )) || chmod 600 "$retry_candidate" || status=$?
+  (( status != 0 )) || mv "$retry_candidate" "$retry_path" || status=$?
+  _sgt_response_lock_release || status=$?
+  return "$status"
+}
+
+_complete_routing() {
+  local current_identity status=0
+  _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
+  _retry_directory_is_safe || status=1
+  if (( status == 0 )) && [[ "$INPUT" == "$retry_path" ]]; then
+    current_identity="$(_sgt_path_identity "$retry_path" 2>/dev/null || true)"
+    if [[ -n "$retry_input_identity" && "$current_identity" == "$retry_input_identity" ]]; then
+      rm -f "$retry_path" || status=$?
+    fi
+  fi
+  (( status != 0 )) || _retry_candidate_is_safe || status=1
+  (( status != 0 )) || rm -f "$retry_candidate" || status=$?
+  (( status != 0 )) || rmdir "$retry_dir" 2>/dev/null || true
+  _sgt_response_lock_release || status=$?
+  if (( status == 0 )); then
+    retry_ready=0
+  fi
+  return "$status"
+}
+
+_cleanup_router_temporaries() {
+  [[ -z "$parsed" ]] || rm -f "$parsed"
+  if _retry_directory_is_safe && _retry_candidate_is_safe; then
+    rm -f "$retry_candidate"
+    rmdir "$retry_dir" 2>/dev/null || true
+  fi
+}
 
 _routing_failure() {
-  local reason="$1" routed="none" remediation="retry the router"
+  local reason="$1" publish_blocked="${2:-1}" routed="none" remediation="retry the router" retry_note="No sanitized retry artifact was available."
   if (( ${#routed_task_ids[@]} > 0 )); then
     routed="$(IFS=', '; printf '%s' "${routed_task_ids[*]}")"
     remediation="$(IFS='; '; printf '%s' "${routed_recommendations[*]}")"
   fi
-  _publish_blocked \
-    "Review finding routing failed. Routed TD tasks: $routed. Recommended remediation: $remediation. No review body was retained. Retry sgt-review-findings after correcting the structured artifact or td failure." \
-    "review finding routing failed; routed td tasks: $routed" || true
+  if _preserve_retry_artifact; then
+    retry_note="Sanitized retry artifact: $retry_path."
+  fi
+  if [[ "$publish_blocked" == "1" ]]; then
+    _publish_blocked \
+      "Review finding routing failed. Routed TD tasks: $routed. Recommended remediation: $remediation. $retry_note Retry sgt-review-findings after correcting the structured artifact or td failure." \
+      "review finding routing failed; routed td tasks: $routed" || true
+  fi
   printf 'ERROR: %s\n' "$reason" >&2
+  [[ "$retry_note" != "No sanitized retry artifact was available." ]] && printf 'Retry artifact: %s\n' "$retry_path" >&2
   exit 2
+}
+
+_review_gate_routing_failure() {
+  local reason="$1"
+  if _sgt_response_lock_release; then
+    _routing_failure "$reason"
+  fi
+  _routing_failure "$reason" 0
 }
 
 for required in INPUT AXIS SOURCE BRANCH HEAD_SHA PARENT_TASK; do
@@ -113,9 +228,11 @@ for required in INPUT AXIS SOURCE BRANCH HEAD_SHA PARENT_TASK; do
   [[ -n "${!required}" ]] || _routing_failure "missing required review field: $field_name"
 done
 [[ "$TASK_ID" != "unknown" ]] || _routing_failure "missing required review field: task_id"
-_axis_re='^(standards|spec|accessibility)$'
+_axis_re='^(standards|spec|accessibility|readiness)$'
 [[ "$AXIS" =~ $_axis_re ]] || _routing_failure "invalid review axis"
 [[ "$SOURCE" =~ ^[A-Za-z0-9._-]+$ ]] || _routing_failure "invalid review source"
+retry_dir="$WORKTREE/.sergeant-review-retries"
+retry_path="$retry_dir/$AXIS-$SOURCE.json"
 
 invocation_generation=""
 invocation_gate_generation=""
@@ -138,6 +255,10 @@ CONFIG_FILE="$SERGEANT_CONFIG/$PROJECT.yaml"
 ( _require_git ) 2>/dev/null || _routing_failure "git is required"
 ( _require_marcus_td ) 2>/dev/null || _routing_failure "td is required (github.com/marcus/td)"
 [[ -f "$INPUT" ]] || _routing_failure "review input is unavailable"
+if [[ "$INPUT" == "$retry_path" ]]; then
+  retry_input_identity="$(_sgt_path_identity "$INPUT" 2>/dev/null)" \
+    || _routing_failure "retry artifact identity is unavailable"
+fi
 
 repo_count="$(yq '.repos | length' "$CONFIG_FILE" 2>/dev/null)" || _routing_failure "project configuration is invalid"
 repo_path=""
@@ -151,13 +272,23 @@ done
 _sgt_is_git_repo "$repo_path" || _routing_failure "owning repository is not a git repository"
 
 parsed="$(mktemp)" || _routing_failure "could not allocate parser output"
-trap 'rm -f "$parsed"' EXIT
-if ! python3 - "$INPUT" > "$parsed" <<'PY'
+trap _cleanup_router_temporaries EXIT
+_prepare_retry_artifact || _routing_failure "retry artifact storage is unsafe or unavailable"
+if ! python3 - "$INPUT" "$retry_candidate" > "$parsed" <<'PY'
 import json
 import re
 import sys
 
 ALLOWED = {"id", "severity", "disposition", "summary", "evidence", "paths", "acceptance_criteria", "recommendation"}
+SEVERITIES = {
+    "error": "error",
+    "warning": "warning",
+    "info": "info",
+    "informational": "informational",
+    "high": "error",
+    "medium": "warning",
+    "low": "info",
+}
 SECRET_VALUE = re.compile(r"(?i)((?:password|token|secret|credential|api[_-]?key)\s*[:=]\s*)([^\s,;]+)")
 BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 BASIC = re.compile(r"(?i)\bbasic\s+[^\s,;]+")
@@ -189,6 +320,7 @@ try:
     findings = document["findings"]
     if not isinstance(findings, list):
         raise ValueError("findings is not a list")
+    sanitized = []
     for finding in findings:
         if not isinstance(finding, dict) or not set(finding).issubset(ALLOWED):
             raise ValueError("finding schema")
@@ -200,25 +332,41 @@ try:
             raise ValueError("finding id")
         severity = finding["severity"]
         disposition = finding["disposition"]
-        if severity not in {"error", "warning", "info", "informational"}:
+        if severity not in SEVERITIES:
             raise ValueError("severity")
+        severity = SEVERITIES[severity]
         if disposition not in {"actionable", "cosmetic", "false-positive"}:
             raise ValueError("disposition")
         paths = finding["paths"]
         if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
             raise ValueError("paths")
+        paths = [clean(path, 240) for path in paths]
+        record = {
+            "id": finding_id,
+            "severity": severity,
+            "disposition": disposition,
+            "summary": clean(finding["summary"], 240),
+            "evidence": clean(finding["evidence"], 1000),
+            "paths": paths,
+            "acceptance_criteria": clean(finding["acceptance_criteria"], 1000),
+            "recommendation": clean(finding["recommendation"], 500),
+        }
+        sanitized.append(record)
         fields = (
-            finding_id,
-            severity,
-            disposition,
-            clean(finding["summary"], 240),
-            clean(finding["evidence"], 1000),
-            ", ".join(clean(path, 240) for path in paths) or "not provided",
-            clean(finding["acceptance_criteria"], 1000),
-            clean(finding["recommendation"], 500),
+            record["id"],
+            record["severity"],
+            record["disposition"],
+            record["summary"],
+            record["evidence"],
+            ", ".join(record["paths"]) or "not provided",
+            record["acceptance_criteria"],
+            record["recommendation"],
         )
         for field in fields:
             sys.stdout.buffer.write(field.encode("utf-8") + b"\0")
+    with open(sys.argv[2], "w", encoding="utf-8") as stream:
+        json.dump({"findings": sanitized}, stream, ensure_ascii=True, separators=(",", ":"))
+        stream.write("\n")
 except (OSError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
     print("invalid review output", file=sys.stderr)
     raise SystemExit(1)
@@ -226,6 +374,7 @@ PY
 then
   _routing_failure "invalid review output"
 fi
+retry_ready=1
 
 fields=()
 while IFS= read -r -d '' field; do
@@ -329,9 +478,17 @@ done
 if (( ${#blocking_tasks[@]} > 0 )); then
   task_list="$(IFS=', '; printf '%s' "${blocking_tasks[*]}")"
   remediation_list="$(IFS='; '; printf '%s' "${blocking_recommendations[*]}")"
+  publish_status=0
   _publish_blocked \
     "Independent review requires remediation. Review axis: $AXIS. Review source: $SOURCE. TD tasks: $task_list. Recommended remediation: $remediation_list" \
-    "independent review requires remediation; td tasks: $task_list"
+    "independent review requires remediation; td tasks: $task_list" || publish_status=$?
+  if (( publish_status != 0 )); then
+    if (( publish_status == 1 )); then
+      _routing_failure "failed to publish blocking review findings" 0
+    fi
+    _routing_failure "failed to publish blocking review findings"
+  fi
+  _complete_routing || _routing_failure "failed to consume retry artifact"
   exit 2
 fi
 
@@ -345,16 +502,21 @@ if [[ -f "$gate_path" ]]; then
   IFS= read -r current_gate_generation < "$gate_path" || true
 fi
 if [[ -n "$invocation_gate_generation" && "$current_gate_generation" == "$invocation_gate_generation" ]]; then
-  rm -f "$gate_path"
-  remaining_message="$(_review_gate_messages)"
+  rm -f "$gate_path" || _review_gate_routing_failure "failed to update review gate state"
+  remaining_message="$(_review_gate_messages)" || _review_gate_routing_failure "failed to update review gate state"
   if [[ -n "$remaining_message" ]]; then
-    printf '%s\n' "$remaining_message" > "$WORKTREE/.sergeant-message.tmp"
-    mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message"
+    printf '%s\n' "$remaining_message" > "$WORKTREE/.sergeant-message.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-message.tmp" "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
   elif [[ "$current_generation" == "$invocation_generation" && "$current_status" == "blocked" ]] &&
        [[ "$current_message" == "Independent review requires remediation."* || "$current_message" == "Review finding routing failed."* ]]; then
-    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp"
-    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
-    rm -f "$WORKTREE/.sergeant-message"
+    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    rm -f "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
     rmdir "$WORKTREE/.sergeant-review-gates" 2>/dev/null || true
   fi
 elif [[ -z "$invocation_gate_generation" && -z "$current_gate_generation" &&
@@ -368,12 +530,19 @@ elif [[ -z "$invocation_gate_generation" && -z "$current_gate_generation" &&
     [[ -f "$_g" ]] && other_axis_gate=true && break
   done
   if [[ "$other_axis_gate" == false ]]; then
-    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp"
-    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status"
-    rm -f "$WORKTREE/.sergeant-message"
+    printf 'in_progress\n' > "$WORKTREE/.sergeant-status.tmp" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    mv "$WORKTREE/.sergeant-status.tmp" "$WORKTREE/.sergeant-status" \
+      || _review_gate_routing_failure "failed to update review gate state"
+    rm -f "$WORKTREE/.sergeant-message" \
+      || _review_gate_routing_failure "failed to update review gate state"
   fi
 fi
-_sgt_response_lock_release || { printf 'ERROR: could not unlock review gate state\n' >&2; exit 2; }
+if ! _sgt_response_lock_release; then
+  _routing_failure "could not unlock review gate state" 0
+fi
+
+_complete_routing || _routing_failure "failed to consume retry artifact"
 
 if (( actionable_count == 0 )); then
   printf 'no actionable findings; continue remediation workflow\n'

@@ -228,6 +228,29 @@ is validated, and escalates to `needs_input` instead of retrying when the prior
 notification delivery still holds an unfinished action lease, the recorded pane
 identity no longer matches, or any later relaunch step fails.
 
+## Route independent review findings
+
+Use `sgt-review-findings` once per review axis with a strict structured artifact:
+
+```bash
+sgt-review-findings <project> <repo> \
+  --input findings.json --axis standards --source code-review \
+  --branch <branch> --head-sha <sha> --parent-task <td-id> \
+  --task-id <fleet-task-id> --worktree <path>
+```
+
+Accepted axes are `standards`, `spec`, `accessibility`, and `readiness`. Accepted
+severities are `error`, `warning`, `info`, and `informational`; `high`, `medium`,
+and `low` normalize to `error`, `warning`, and `info` before priority and blocking
+rules are applied.
+
+If downstream routing fails after sanitization, the command atomically preserves
+`.sergeant-review-retries/<axis>-<source>.json` in the worktree and reports the
+full path. Correct the routing failure, then rerun the command with that path as
+`--input`. Deduplication updates findings already routed before the failure, and
+a successful retry consumes the artifact. A newer failed attempt supersedes the
+older artifact without exposing unsanitized review content.
+
 ## Reconcile results
 
 For each repository require:

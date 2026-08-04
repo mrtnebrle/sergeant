@@ -5,6 +5,7 @@ export TMUX=fixture TMUX_PANE=%11
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 mkdir -p \
@@ -38,6 +39,7 @@ case "${1:-}" in
   new-window)
     for repo_state in "$SERGEANT_FLEET"/*/*; do
       [[ -d "$repo_state" ]] || continue
+      [[ ! -s "$repo_state/notification_delivered" ]] || continue
       notification_id="$(cat "$repo_state/notification_id")"
       worktree="$(cat "$repo_state/worktree")"
       printf '%s|0|%%42|4242|123456|fixture-worker-command\n' "$notification_id" \
@@ -409,6 +411,10 @@ assert_contains "Do not blend or rerank the axes"
 assert_not_contains "Accessibility axis"
 assert_contains "sgt-review-findings"
 assert_contains "structured JSON finding artifact"
+assert_contains "accepts \`standards\`, \`spec\`, \`accessibility\`, and \`readiness\` axes"
+assert_contains "normalizes \`high\`, \`medium\`, and \`low\`"
+assert_contains '.sergeant-review-retries/<axis>-<source>.json'
+assert_contains "A successful retry consumes the artifact"
 assert_contains "review bodies, prompts, secrets, or credentials"
 assert_contains "task IDs and recommended remediation"
 assert_contains "rerun only affected tests and review checks"
@@ -573,6 +579,7 @@ dispatch_and_assert_accessibility() {
   local group_instructions="$5"
   local default_instructions="${6:-Maintain fleet automation}"
   local repo_instructions="${7:-Maintain repository automation}"
+  local generated_worktree generated_task_id
 
   write_routing_config "$role" "$group" "$group_description" "$group_instructions" "$default_instructions" "$repo_instructions"
   PATH="$TEST_ROOT/fake-bin:$PATH" \
@@ -585,6 +592,11 @@ dispatch_and_assert_accessibility() {
   [[ -f "$brief" ]] || { printf 'UI-facing brief was not generated\n' >&2; exit 1; }
   assert_contains "Accessibility axis"
   assert_contains "independent accessibility review"
+  generated_worktree="$(dirname "$brief")"
+  generated_task_id="${generated_worktree##*/}"
+  generated_task_id="${generated_task_id#app-sgt-}"
+  git -C "$TEST_ROOT/repo" worktree remove --force "$generated_worktree"
+  rm -rf "$TEST_ROOT/fleet/$generated_task_id"
 }
 
 ui_triggers=(
