@@ -45,6 +45,7 @@ for policy_file in AGENTS.md skills/dispatch/SKILL.md README.md docs/using-serge
   require_text "$policy_file" "rerun only affected tests and review checks"
 done
 reject_text "AGENTS.md" "All future generated worker briefs encode"
+# shellcheck disable=SC2016
 require_text "AGENTS.md" '`tests/sgt-dispatch-brief-test.sh` must fail when this output omits it'
 require_text "docs/getting-started.md" "for agent in opencode goose claude"
 require_text "docs/getting-started.md" "Install OpenCode, Goose, or Claude before using Sergeant interactive dispatch."
@@ -59,6 +60,7 @@ require_text "AGENTS.md" ".sergeant-intent.md"
 require_text "AGENTS.md" "same canonical intent revision"
 require_text "AGENTS.md" "td context <id> --work-dir <owning-repo-path>"
 require_text "AGENTS.md" "ingest, backfill, regenerate, inspect, update, or change the wiki"
+# shellcheck disable=SC2016
 require_text "AGENTS.md" 'Sergeant-owned procedural skills live at `skills/<name>/SKILL.md`'
 require_text "AGENTS.md" "read that repository-local file directly"
 require_text "AGENTS.md" "takes precedence over any same-named registry skill"
