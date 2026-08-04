@@ -5,7 +5,21 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+race_recover_pid=""
+race_watch_pid=""
+_cleanup_test() {
+  [[ -z "$race_watch_pid" ]] || kill "$race_watch_pid" 2>/dev/null || true
+  [[ -z "$race_recover_pid" ]] || kill "$race_recover_pid" 2>/dev/null || true
+  [[ -z "$race_watch_pid" ]] || wait "$race_watch_pid" 2>/dev/null || true
+  [[ -z "$race_recover_pid" ]] || wait "$race_recover_pid" 2>/dev/null || true
+  rm -rf "$TEST_ROOT"
+}
+trap '_cleanup_test' EXIT
+TMUX_KILLED_DIR="$TEST_ROOT/killed-panes"
+TMUX_NEW_DIR="$TEST_ROOT/new-panes"
+TMUX_OLD_IDENTITY_FILE="$TEST_ROOT/old-pane-identity"
+mkdir -p "$TMUX_KILLED_DIR" "$TMUX_NEW_DIR"
+export TMUX_KILLED_DIR TMUX_NEW_DIR TMUX_OLD_IDENTITY_FILE
 
 fleet="$TEST_ROOT/fleet"
 task_dir="$fleet/task-1"
@@ -40,22 +54,37 @@ printf 'Project: test\nBrief: recover test\nBranch: recover-test\nRepos: app\n' 
 _setup_stalled_worker() {
   local repo_dir="$1"
   local wt="$2"
-  local pane="${3:-%42}"
+  local pane="${3:-%42}" new_pane_marker="${NEW_PANE:-%99}"
 
   mkdir -p "$repo_dir"
+  rm -f "$TMUX_KILLED_DIR/${pane#%}"
+  rm -f "$TMUX_KILLED_DIR/${new_pane_marker#%}"
+  rm -f "$TMUX_NEW_DIR/${new_pane_marker#%}"
   printf '%s\n' "$wt" > "$repo_dir/worktree"
   printf 'in_progress\n' > "$repo_dir/status"
   printf 'in_progress\n' > "$wt/.sergeant-status"
   printf 'live worker stalled: no progress for 401s (grace=300s); last event at epoch 1000\n' \
     > "$repo_dir/diagnostic"
   printf '%s\n' "$pane" > "$repo_dir/pane"
-  printf '0|%s|4242|123456|sgt-interactive-worker:%s\n' "$pane" "$repo_dir" \
-    > "$repo_dir/pane_identity"
+  printf -v worker_command '%q %q %q %q' \
+    "$ROOT_DIR/bin/sgt-interactive-worker" "$repo_dir" "$wt" opencode
+  printf '0|%s|4242|123456|%s\n' "$pane" "$worker_command" > "$repo_dir/pane_identity"
+  cp "$repo_dir/pane_identity" "$TMUX_OLD_IDENTITY_FILE"
   chmod 600 "$repo_dir/pane_identity"
   printf 'sgt\n' > "$repo_dir/tmux_session"
   printf 'task/app\n' > "$repo_dir/window_name"
   printf 'opencode\n' > "$repo_dir/agent"
   printf 'td-123\n' > "$repo_dir/td_task"
+  printf '4242\n' > "$repo_dir/worker_pid"
+  printf '4242\n' > "$repo_dir/worker_process_group"
+  printf 'Mon Jan  1 00:00:00 2024\n' > "$repo_dir/worker_process_start"
+  printf '%s\n' "$ROOT_DIR/bin/sgt-interactive-worker" > "$repo_dir/worker_executable"
+  chmod 600 "$repo_dir/worker_pid" "$repo_dir/worker_process_group" \
+    "$repo_dir/worker_process_start" "$repo_dir/worker_executable"
+  rm -f "$repo_dir/replacement_phase" "$repo_dir/replacement_candidate_pane" \
+    "$repo_dir/replacement_candidate_pane_identity" \
+    "$repo_dir/replacement_previous_pane" \
+    "$repo_dir/replacement_previous_pane_identity"
 }
 
 # ── Fake tmux ───────────────────────────────────────────────────────────────
@@ -81,9 +110,20 @@ case "$1" in
       [[ "$previous" == -t ]] && target="$arg"
       previous="$arg"
     done
-    pane_identity="${PANE_IDENTITY:-0|%42|4242|123456|sgt-interactive-worker:$EXPECTED_WORKER}"
+    [[ ! -e "$TMUX_KILLED_DIR/${target#%}" ]] || exit 1
+    if [[ -n "${RECOVERY_RACE_OLD_PANE_ABSENT:-}" &&
+          -e "$RECOVERY_RACE_OLD_PANE_ABSENT" &&
+          "$target" == "${RECOVERY_RACE_OLD_PANE:-%42}" ]]; then
+      exit 1
+    fi
+    base_identity="$(cat "$TMUX_OLD_IDENTITY_FILE")"
+    base_remainder="${base_identity#*|}"
+    base_remainder="${base_remainder#*|}"
+    base_remainder="${base_remainder#*|}"
+    worker_command="${base_remainder#*|}"
+    pane_identity="${PANE_IDENTITY:-0|$target|4242|123456|$worker_command}"
     if [[ "$target" == "${NEW_PANE:-%99}" ]]; then
-      pane_identity="0|$target|9999|654321|sgt-interactive-worker:$EXPECTED_WORKER"
+      pane_identity="0|$target|9999|654321|$worker_command"
     fi
     # Auto-deliver notification to new pane
     if [[ "${AUTO_DELIVER:-1}" == 1 && "$target" == "${NEW_PANE:-%99}" &&
@@ -109,8 +149,49 @@ case "$1" in
     [[ "${FAIL_WINDOW:-0}" == 0 ]] || exit 7
     [[ "${EMPTY_WINDOW:-0}" == 0 ]] || exit 0
     new_pane="${NEW_PANE:-%99}"
+    : > "$TMUX_NEW_DIR/${new_pane#%}"
+    printf '9999\n' > "$EXPECTED_WORKER/worker_pid"
+    printf '9999\n' > "$EXPECTED_WORKER/worker_process_group"
+    printf 'Tue Jan  2 00:00:00 2024\n' > "$EXPECTED_WORKER/worker_process_start"
+    printf '/replacement/sgt-interactive-worker\n' > "$EXPECTED_WORKER/worker_executable"
+    chmod 600 "$EXPECTED_WORKER/worker_pid" "$EXPECTED_WORKER/worker_process_group" \
+      "$EXPECTED_WORKER/worker_process_start" "$EXPECTED_WORKER/worker_executable"
     [[ -z "${WINDOW_LOG:-}" ]] || printf '%s\n' "$*" >> "$WINDOW_LOG"
     printf '%s\n' "$new_pane"
+    ;;
+  list-panes)
+    base_identity="$(cat "$TMUX_OLD_IDENTITY_FILE")"
+    base_remainder="${base_identity#*|}"
+    base_pane="${base_remainder%%|*}"
+    if [[ ! -e "$TMUX_KILLED_DIR/${base_pane#%}" &&
+          ( -z "${RECOVERY_RACE_OLD_PANE_ABSENT:-}" ||
+            ! -e "$RECOVERY_RACE_OLD_PANE_ABSENT" ) ]]; then
+      if [[ "${!#}" == '#{pane_id}' ]]; then
+        printf '%s\n' "$base_pane"
+      else
+        printf '%s\n' "$base_identity"
+      fi
+    fi
+    new_pane="${NEW_PANE:-%99}"
+    if [[ -e "$TMUX_NEW_DIR/${new_pane#%}" && ! -e "$TMUX_KILLED_DIR/${new_pane#%}" ]]; then
+      base_remainder="${base_identity#*|}"
+      base_remainder="${base_remainder#*|}"
+      base_remainder="${base_remainder#*|}"
+      worker_command="${base_remainder#*|}"
+      if [[ "${!#}" == '#{pane_id}' ]]; then
+        printf '%s\n' "$new_pane"
+      else
+        printf '0|%s|9999|654321|%s\n' "$new_pane" "$worker_command"
+      fi
+    fi
+    if [[ -n "${EXTRA_PANE_IDENTITY:-}" ]]; then
+      if [[ "${!#}" == '#{pane_id}' ]]; then
+        extra_remainder="${EXTRA_PANE_IDENTITY#*|}"
+        printf '%s\n' "${extra_remainder%%|*}"
+      else
+        printf '%s\n' "$EXTRA_PANE_IDENTITY"
+      fi
+    fi
     ;;
   kill-pane)
     # Record which pane was killed; verify it is the exact pane, not a prefix collision
@@ -121,6 +202,11 @@ case "$1" in
       previous="$arg"
     done
     [[ -z "${KILL_LOG:-}" ]] || printf '%s\n' "$target_pane" >> "$KILL_LOG"
+    if [[ "${FAIL_KILL_PANE:-}" == "all" ||
+          ( -n "${FAIL_KILL_PANE:-}" && "$target_pane" == "$FAIL_KILL_PANE" ) ]]; then
+      exit 9
+    fi
+    : > "$TMUX_KILLED_DIR/${target_pane#%}"
     ;;
   send-keys) exit 0 ;;
   *)
@@ -130,6 +216,24 @@ case "$1" in
 esac
 TMUX
 chmod +x "$fake_bin/tmux"
+
+real_date="$(command -v date)"
+cat > "$fake_bin/date" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${RECOVERY_PRE_PHASE_READY:-}" && ! -e "$RECOVERY_PRE_PHASE_READY" ]]; then
+  : > "$RECOVERY_RACE_OLD_PANE_ABSENT"
+  : > "$RECOVERY_PRE_PHASE_READY"
+  attempt=0
+  while [[ ! -e "$RECOVERY_PRE_PHASE_RELEASE" && "$attempt" -lt 500 ]]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+  done
+  [[ -e "$RECOVERY_PRE_PHASE_RELEASE" ]] || exit 71
+fi
+exec "$REAL_DATE" "$@"
+EOF
+chmod +x "$fake_bin/date"
+export REAL_DATE="$real_date"
 
 cat > "$fake_bin/td" <<'EOF'
 #!/usr/bin/env bash
@@ -173,6 +277,10 @@ EXPECTED_WORKER="$repo_state" KILL_LOG="$TEST_ROOT/killed.log" \
   printf 'stall_recovery_attempted should be written\n' >&2
   exit 1
 }
+[[ "$(cat "$repo_state/worker_pid")" == "9999" ]]
+[[ ! -e "$repo_state/replacement_phase" ]]
+[[ ! -e "$repo_state/replacement_candidate_pane" ]]
+[[ ! -e "$repo_state/replacement_candidate_pane_identity" ]]
 
 # Old pane was killed
 grep -Fq '%42' "$TEST_ROOT/killed.log" || {
@@ -205,6 +313,63 @@ grep -Fq 'new-window' "$TEST_ROOT/windows.log" || {
 }
 
 printf 'sgt-recover happy path: ok\n'
+
+# ── Slice 1b: watch cannot orphan recovery between verification and phase ────
+
+_setup_stalled_worker "$repo_state" "$worktree"
+rm -f "$repo_state/stall_recovery_attempted"
+race_ready="$TEST_ROOT/recovery-pre-phase-ready"
+race_release="$TEST_ROOT/recovery-pre-phase-release"
+race_old_absent="$TEST_ROOT/recovery-old-pane-absent"
+race_recover_log="$TEST_ROOT/recovery-race-recover.log"
+race_watch_log="$TEST_ROOT/recovery-race-watch.log"
+
+EXPECTED_WORKER="$repo_state" RECOVERY_PRE_PHASE_READY="$race_ready" \
+  RECOVERY_PRE_PHASE_RELEASE="$race_release" \
+  RECOVERY_RACE_OLD_PANE_ABSENT="$race_old_absent" \
+  PATH="$fake_bin:$PATH" SERGEANT_FLEET="$fleet" \
+  "$ROOT_DIR/bin/sgt-recover" task-1 app >"$race_recover_log" 2>&1 &
+race_recover_pid=$!
+
+for _attempt in {1..500}; do
+  [[ -e "$race_ready" ]] && break
+  kill -0 "$race_recover_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -e "$race_ready" ]] || {
+  printf 'recovery did not reach the pre-phase race boundary\n' >&2
+  exit 1
+}
+
+EXPECTED_WORKER="$repo_state" RECOVERY_RACE_OLD_PANE_ABSENT="$race_old_absent" \
+  PATH="$fake_bin:$PATH" SERGEANT_FLEET="$fleet" \
+  "$ROOT_DIR/bin/sgt-watch" --sync task-1 >"$race_watch_log" 2>&1 &
+race_watch_pid=$!
+
+race_observed=false
+for _attempt in {1..500}; do
+  if ! kill -0 "$race_watch_pid" 2>/dev/null || \
+     compgen -G "$repo_state/.response.lock.*" >/dev/null; then
+    race_observed=true
+    break
+  fi
+  sleep 0.01
+done
+$race_observed || {
+  printf 'watch did not reach the recovery serialization boundary\n' >&2
+  exit 1
+}
+
+: > "$race_release"
+wait "$race_recover_pid"
+race_recover_pid=""
+wait "$race_watch_pid"
+race_watch_pid=""
+
+[[ "$(cat "$repo_state/status")" == "in_progress" ]]
+[[ "$(cat "$worktree/.sergeant-status")" == "in_progress" ]]
+[[ "$(cat "$repo_state/pane")" == "%99" ]]
+printf 'sgt-recover serializes watch orphan classification: ok\n'
 
 # ── Slice 2a: Refused when status is not in_progress ─────────────────────────
 
@@ -408,6 +573,7 @@ kill4_content="$(cat "$TEST_ROOT/kill4.log" 2>/dev/null || true)"
     "$kill4_content" >&2
   exit 1
 }
+[[ ! -e "$repo_state/replacement_phase" ]]
 
 printf 'sgt-recover tmux failure escalates: ok\n'
 
@@ -490,7 +656,73 @@ fi
 
 printf 'sgt-recover identity mismatch — wrong pane untouched: ok\n'
 
-# ── Slice 7: Unfinished action_lease blocks recovery ──────────────────────────
+_setup_stalled_worker "$repo_state" "$worktree"
+rm -f "$repo_state/stall_recovery_attempted" "$TEST_ROOT/duplicate-window.log"
+old_identity="$(cat "$TMUX_OLD_IDENTITY_FILE")"
+old_remainder="${old_identity#*|}"
+old_remainder="${old_remainder#*|}"
+old_remainder="${old_remainder#*|}"
+worker_command="${old_remainder#*|}"
+duplicate_identity="0|%41|4141|123455|$worker_command"
+
+set +e
+EXPECTED_WORKER="$repo_state" EXTRA_PANE_IDENTITY="$duplicate_identity" \
+  WINDOW_LOG="$TEST_ROOT/duplicate-window.log" PATH="$fake_bin:$PATH" \
+  SERGEANT_FLEET="$fleet" "$ROOT_DIR/bin/sgt-recover" task-1 app >/dev/null 2>&1
+duplicate_status=$?
+set -e
+
+[[ "$duplicate_status" -ne 0 ]]
+[[ ! -e "$TEST_ROOT/duplicate-window.log" ]]
+grep -Fq 'another live worker pane %41 owns this fleet state' "$repo_state/diagnostic"
+printf 'sgt-recover duplicate live worker blocks replacement: ok\n'
+
+# ── Slice 7: failed old-pane termination rolls back replacement ownership ────
+
+_setup_stalled_worker "$repo_state" "$worktree"
+rm -f "$repo_state/stall_recovery_attempted" "$TEST_ROOT/kill-rollback.log"
+old_identity="$(cat "$repo_state/pane_identity")"
+old_worker_pid="$(cat "$repo_state/worker_pid")"
+
+set +e
+EXPECTED_WORKER="$repo_state" KILL_LOG="$TEST_ROOT/kill-rollback.log" \
+  FAIL_KILL_PANE=%42 PATH="$fake_bin:$PATH" SERGEANT_FLEET="$fleet" \
+  "$ROOT_DIR/bin/sgt-recover" task-1 app >/dev/null 2>&1
+rollback_status=$?
+set -e
+
+[[ "$rollback_status" -ne 0 ]]
+[[ "$(cat "$repo_state/pane")" == "%42" ]]
+[[ "$(cat "$repo_state/pane_identity")" == "$old_identity" ]]
+[[ "$(cat "$repo_state/worker_pid")" == "$old_worker_pid" ]]
+grep -Fq '%99' "$TEST_ROOT/kill-rollback.log"
+grep -Fq 'could not terminate superseded worker pane %42' "$repo_state/diagnostic"
+printf 'sgt-recover failed old-pane termination restores ownership: ok\n'
+
+_setup_stalled_worker "$repo_state" "$worktree"
+rm -f "$repo_state/stall_recovery_attempted" "$TEST_ROOT/double-kill.log"
+old_identity="$(cat "$repo_state/pane_identity")"
+
+set +e
+EXPECTED_WORKER="$repo_state" KILL_LOG="$TEST_ROOT/double-kill.log" \
+  FAIL_KILL_PANE=all PATH="$fake_bin:$PATH" SERGEANT_FLEET="$fleet" \
+  "$ROOT_DIR/bin/sgt-recover" task-1 app >/dev/null 2>&1
+double_kill_status=$?
+set -e
+
+[[ "$double_kill_status" -ne 0 ]]
+[[ "$(cat "$repo_state/pane")" == "%99" ]]
+[[ "$(cat "$repo_state/pane_identity")" == 0\|%99\|9999\|654321\|* ]]
+[[ "$(cat "$repo_state/replacement_previous_pane")" == "%42" ]]
+[[ "$(cat "$repo_state/replacement_previous_pane_identity")" == "$old_identity" ]]
+[[ "$(cat "$repo_state/worker_pid")" == "9999" ]]
+[[ "$(cat "$repo_state/replacement_previous_worker_pid")" == "4242" ]]
+[[ "$(cat "$repo_state/replacement_phase")" == "launching" ]]
+grep -Fq 'replacement pane %99 could not be terminated and remains recorded' \
+  "$repo_state/diagnostic"
+printf 'sgt-recover double termination failure preserves both identities: ok\n'
+
+# ── Slice 8: Unfinished action_lease blocks recovery ──────────────────────────
 # Bug 1 regression: if the stalled worker holds an unfinished notification
 # action_lease (accepted a notification but died before writing 'completed'),
 # recovery must refuse rather than destroy the exact-once evidence.
