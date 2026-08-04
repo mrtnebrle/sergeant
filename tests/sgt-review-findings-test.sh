@@ -76,6 +76,7 @@ cat > "$INSTALLED_BIN/sgt-notify" <<'EOF'
 # committed after notify, so .sergeant-status.tmp may exist, but .sergeant-message
 # must already be present if any message was collected).
 printf '%s\n' "$*" >> "$NOTIFY_LOG"
+[[ "${NOTIFY_FAIL:-0}" != "1" ]] || exit 17
 EOF
 chmod +x "$INSTALLED_BIN/sgt-notify"
 
@@ -134,6 +135,7 @@ run_router() {
     TD_REPLACE_RETRY_ON_LIST="${TD_REPLACE_RETRY_ON_LIST:-0}" \
     RETRY_PATH="${RETRY_PATH:-$WORKTREE/.sergeant-review-retries/standards-code-review.json}" \
     RETRY_REPLACED_MARKER="${RETRY_REPLACED_MARKER:-$TEST_ROOT/retry-replaced}" \
+    NOTIFY_FAIL="${NOTIFY_FAIL:-0}" \
     "$INSTALLED_BIN/sgt-review-findings" test app \
       --input "$1" --axis "${ROUTER_AXIS:-standards}" --source code-review \
       --branch fix/review --head-sha abc1234 --parent-task td-parent \
@@ -399,6 +401,29 @@ grep -Fxq '{"findings":[]}' "$retry_path" || {
   printf 'successful retry removed a newer retry artifact\n' >&2
   exit 1
 }
+
+NOTIFY_FAIL=1 run_router "$TEST_ROOT/findings.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+[[ "$status" -eq 2 && "$output" == *'failed to publish blocking review findings'* ]] || {
+  printf 'post-routing publication failure bypassed retry retention: status=%s output=%s\n' "$status" "$output" >&2
+  exit 1
+}
+[[ -f "$retry_path" ]]
+[[ "$output" == *"$retry_path"* ]]
+grep -Fq "$retry_path" "$WORKTREE/.sergeant-message"
+
+outside_retry_dir="$TEST_ROOT/outside-retries"
+rm -rf "$WORKTREE/.sergeant-review-retries"
+mkdir -p "$outside_retry_dir"
+ln -s "$outside_retry_dir" "$WORKTREE/.sergeant-review-retries"
+TD_FAIL_CREATE=1 PRESERVE_FLEET=1 run_router "$TEST_ROOT/secrets.json"
+[[ "$status" -eq 2 ]]
+[[ ! -e "$outside_retry_dir/standards-code-review.json" ]] || {
+  printf 'symlinked retry directory redirected artifact outside worktree\n' >&2
+  exit 1
+}
+rm -f "$WORKTREE/.sergeant-review-retries"
+rm -rf "$outside_retry_dir"
 
 # Missing prerequisite tool (yq absent) must publish blocked state
 mkdir -p "$TEST_ROOT/no-yq-bin"

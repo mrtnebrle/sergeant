@@ -99,18 +99,57 @@ _publish_blocked() {
 
 routed_task_ids=()
 routed_recommendations=()
+parsed=""
 retry_candidate=""
+retry_candidate_identity=""
+retry_dir=""
 retry_input_identity=""
 retry_path=""
 retry_ready=0
 
+_retry_directory_is_safe() {
+  [[ -d "$retry_dir" && ! -L "$retry_dir" ]]
+}
+
+_retry_destination_is_safe() {
+  [[ ! -e "$retry_path" && ! -L "$retry_path" ]] || [[ -f "$retry_path" && ! -L "$retry_path" ]]
+}
+
+_retry_candidate_is_safe() {
+  local current_identity
+  [[ -n "$retry_candidate" && -n "$retry_candidate_identity" && -f "$retry_candidate" && ! -L "$retry_candidate" ]] || return 1
+  current_identity="$(_sgt_path_identity "$retry_candidate" 2>/dev/null)" || return 1
+  [[ "$current_identity" == "$retry_candidate_identity" ]]
+}
+
+_prepare_retry_artifact() {
+  local status=0
+  _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
+  if [[ -L "$retry_dir" || ( -e "$retry_dir" && ! -d "$retry_dir" ) ]]; then
+    status=1
+  else
+    mkdir -p "$retry_dir" || status=$?
+    (( status != 0 )) || chmod 700 "$retry_dir" || status=$?
+    (( status != 0 )) || _retry_destination_is_safe || status=1
+    if (( status == 0 )); then
+      retry_candidate="$(mktemp "$retry_dir/.$AXIS-$SOURCE.json.tmp.XXXXXX")" || status=$?
+    fi
+    (( status != 0 )) || chmod 600 "$retry_candidate" || status=$?
+    if (( status == 0 )); then
+      retry_candidate_identity="$(_sgt_path_identity "$retry_candidate" 2>/dev/null)" || status=$?
+    fi
+  fi
+  _sgt_response_lock_release || status=$?
+  return "$status"
+}
+
 _preserve_retry_artifact() {
-  local retry_dir status=0
+  local status=0
   [[ "$retry_ready" == "1" && -n "$retry_candidate" && -s "$retry_candidate" && -n "$retry_path" ]] || return 1
   _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
-  retry_dir="${retry_path%/*}"
-  mkdir -p "$retry_dir" || status=$?
-  (( status != 0 )) || chmod 700 "$retry_dir" || status=$?
+  _retry_directory_is_safe || status=1
+  (( status != 0 )) || _retry_destination_is_safe || status=1
+  (( status != 0 )) || _retry_candidate_is_safe || status=1
   (( status != 0 )) || chmod 600 "$retry_candidate" || status=$?
   (( status != 0 )) || mv "$retry_candidate" "$retry_path" || status=$?
   _sgt_response_lock_release || status=$?
@@ -118,22 +157,31 @@ _preserve_retry_artifact() {
 }
 
 _complete_routing() {
-  local retry_dir current_identity status=0
+  local current_identity status=0
   _sgt_response_lock_acquire "$WORKTREE" ".sergeant-review-retries.lock" || return 1
-  if [[ "$INPUT" == "$retry_path" ]]; then
+  _retry_directory_is_safe || status=1
+  if (( status == 0 )) && [[ "$INPUT" == "$retry_path" ]]; then
     current_identity="$(_sgt_path_identity "$retry_path" 2>/dev/null || true)"
     if [[ -n "$retry_input_identity" && "$current_identity" == "$retry_input_identity" ]]; then
       rm -f "$retry_path" || status=$?
-      retry_dir="${retry_path%/*}"
-      (( status != 0 )) || rmdir "$retry_dir" 2>/dev/null || true
     fi
   fi
+  (( status != 0 )) || _retry_candidate_is_safe || status=1
   (( status != 0 )) || rm -f "$retry_candidate" || status=$?
+  (( status != 0 )) || rmdir "$retry_dir" 2>/dev/null || true
   _sgt_response_lock_release || status=$?
   if (( status == 0 )); then
     retry_ready=0
   fi
   return "$status"
+}
+
+_cleanup_router_temporaries() {
+  [[ -z "$parsed" ]] || rm -f "$parsed"
+  if _retry_directory_is_safe && _retry_candidate_is_safe; then
+    rm -f "$retry_candidate"
+    rmdir "$retry_dir" 2>/dev/null || true
+  fi
 }
 
 _routing_failure() {
@@ -161,7 +209,8 @@ done
 _axis_re='^(standards|spec|accessibility|readiness)$'
 [[ "$AXIS" =~ $_axis_re ]] || _routing_failure "invalid review axis"
 [[ "$SOURCE" =~ ^[A-Za-z0-9._-]+$ ]] || _routing_failure "invalid review source"
-retry_path="$WORKTREE/.sergeant-review-retries/$AXIS-$SOURCE.json"
+retry_dir="$WORKTREE/.sergeant-review-retries"
+retry_path="$retry_dir/$AXIS-$SOURCE.json"
 
 invocation_generation=""
 invocation_gate_generation=""
@@ -201,9 +250,8 @@ done
 _sgt_is_git_repo "$repo_path" || _routing_failure "owning repository is not a git repository"
 
 parsed="$(mktemp)" || _routing_failure "could not allocate parser output"
-retry_candidate="$(mktemp "$WORKTREE/.sergeant-review-retry.$AXIS-$SOURCE.XXXXXX")" \
-  || _routing_failure "could not allocate retry artifact"
-trap 'rm -f "$parsed" "$retry_candidate"' EXIT
+trap _cleanup_router_temporaries EXIT
+_prepare_retry_artifact || _routing_failure "retry artifact storage is unsafe or unavailable"
 if ! python3 - "$INPUT" "$retry_candidate" > "$parsed" <<'PY'
 import json
 import re
@@ -405,14 +453,15 @@ if matches:
   routed_recommendations+=("$recommendation")
 done
 
-_complete_routing || _routing_failure "failed to consume retry artifact"
-
 if (( ${#blocking_tasks[@]} > 0 )); then
   task_list="$(IFS=', '; printf '%s' "${blocking_tasks[*]}")"
   remediation_list="$(IFS='; '; printf '%s' "${blocking_recommendations[*]}")"
-  _publish_blocked \
+  if ! _publish_blocked \
     "Independent review requires remediation. Review axis: $AXIS. Review source: $SOURCE. TD tasks: $task_list. Recommended remediation: $remediation_list" \
-    "independent review requires remediation; td tasks: $task_list"
+    "independent review requires remediation; td tasks: $task_list"; then
+    _routing_failure "failed to publish blocking review findings"
+  fi
+  _complete_routing || _routing_failure "failed to consume retry artifact"
   exit 2
 fi
 
@@ -454,7 +503,9 @@ elif [[ -z "$invocation_gate_generation" && -z "$current_gate_generation" &&
     rm -f "$WORKTREE/.sergeant-message"
   fi
 fi
-_sgt_response_lock_release || { printf 'ERROR: could not unlock review gate state\n' >&2; exit 2; }
+_sgt_response_lock_release || _routing_failure "could not unlock review gate state"
+
+_complete_routing || _routing_failure "failed to consume retry artifact"
 
 if (( actionable_count == 0 )); then
   printf 'no actionable findings; continue remediation workflow\n'
