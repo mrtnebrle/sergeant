@@ -146,6 +146,10 @@ SGT_WIKI_DISABLED=1 \
 
 brief="$(printf '%s\n' "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
 [[ -f "$brief" ]] || { printf 'brief was not generated\n' >&2; exit 1; }
+grep -Fxq 'review_level=medium' "$brief" || {
+  printf 'brief review level is not machine-readable\n' >&2
+  exit 1
+}
 
 task_dir="$(printf '%s\n' "$TEST_ROOT"/fleet/*)"
 fleet_intent="$task_dir/.sergeant-intent.md"
@@ -184,6 +188,14 @@ grep -Fxq 'Harden worker loop' "$fleet_intent" || {
   printf 'canonical intent did not preserve the dispatch objective\n' >&2
   exit 1
 }
+grep -Fq 'at most one repository-required full suite' "$fleet_intent" || {
+  printf 'canonical intent did not use the medium validation policy\n' >&2
+  exit 1
+}
+if grep -Fq 'focused and full native validation' "$fleet_intent"; then
+  printf 'canonical intent retained the high-scrutiny full-suite policy\n' >&2
+  exit 1
+fi
 
 cat > "$TEST_ROOT/approved-intent.md" <<'EOF'
 # Sergeant Intent
@@ -339,6 +351,7 @@ assert_order() {
 }
 
 assert_contains "merge-base with the current origin/main"
+assert_not_contains "**Review level:**"
 assert_contains "**td task:** td-app-1"
 assert_contains "td start td-app-1 --work-dir ."
 assert_contains "td handoff td-app-1 --work-dir ."
@@ -366,19 +379,27 @@ assert_contains "notification_id|target_nonce"
 assert_contains ".sergeant-notification-accepts/"
 assert_contains ".sergeant-notification-complete/"
 assert_contains "Do not act until that supervisor sends acceptance"
-assert_contains "full required suite once at the end"
+assert_contains "at most one repository-required full suite"
+assert_not_contains "full required suite once at the end"
 assert_contains "Never run no-mistakes from this agent process"
 assert_contains '.sergeant-validation-ready'
+assert_contains 'readiness_review=passed'
 assert_contains 'sgt-validate'
 assert_contains "without \`--yes\`"
 assert_not_contains "An explicit user instruction to run no-mistakes overrides this default"
 assert_not_contains 'no-mistakes axi run --intent'
 assert_not_contains "Run no-mistakes when available or required"
-assert_contains "### 6. Route no-mistakes findings"
+assert_contains "### 9. Route no-mistakes findings"
 assert_contains "coordinator owns every no-mistakes gate and finding"
 assert_contains "Do not approve a validation gate"
 assert_contains "separate deduplicated td work"
-assert_contains "separate parallel subagents"
+assert_contains "one bounded independent review pass"
+assert_contains "Run each required axis once in the initial pass"
+assert_contains "correctness, regressions, and material scope errors"
+assert_contains "Ignore cosmetic observations and speculative refactoring"
+assert_contains "additional risk review only when active repository or task policy explicitly requires it"
+assert_not_contains "launch an independent readiness review"
+assert_not_contains "separate parallel subagents"
 assert_contains "Standards axis"
 assert_contains "Fowler smell heuristic"
 assert_contains "skip findings enforced by tooling"
@@ -390,7 +411,14 @@ assert_contains "sgt-review-findings"
 assert_contains "structured JSON finding artifact"
 assert_contains "review bodies, prompts, secrets, or credentials"
 assert_contains "task IDs and recommended remediation"
-assert_contains "blocking findings are zero"
+assert_contains "rerun only affected tests and review checks"
+assert_contains "Do not rerun the repository full suite or every independent review axis"
+assert_not_contains "rerun all required independent review axes"
+assert_contains "blocking findings remain zero"
+assert_contains "default medium profile"
+assert_contains "bounded Standards/Spec review pass completed"
+assert_contains "does not attest that an unconditional standalone readiness-risk review ran"
+assert_contains "no repeated no-mistakes cycles"
 assert_contains "required CI is green"
 assert_contains "no unresolved non-outdated review threads"
 assert_contains "dependency order is satisfied"
@@ -446,10 +474,11 @@ assert_order \
   "### 3. Implement approved work with TDD" \
   "### 4. Escalate and resume" \
   "### 5. Validate" \
-  "### 6. Route no-mistakes findings" \
-  "### 7. Independent two-axis review" \
-  "### 8. Remediate and repeat" \
-  "### 9. Complete delivery and td lifecycle"
+  "### 6. One bounded independent two-axis review pass" \
+  "### 7. Remediate affected checks" \
+  "### 8. Publish readiness and run coordinator validation" \
+  "### 9. Route no-mistakes findings" \
+  "### 10. Complete delivery and td lifecycle"
 
 assert_order \
   "Surface \`wayfinder\`, \`to-spec\`, and Sergeant's custom \`to-tickets\`" \
@@ -586,6 +615,29 @@ SERGEANT_FLEET="$TEST_ROOT/fleet" \
 SGT_WIKI_DISABLED=1 \
   "$ROOT_DIR/bin/sgt-dispatch" test "Maintain nonvisual backend mission" --repos app >/dev/null
 brief="$(grep -rl "^Maintain nonvisual backend mission$" "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
+assert_not_contains "Accessibility axis"
+
+write_routing_config "Backend service" "product" "Internal services" "Maintain deployment automation"
+policy_mission="Document that accessibility review applies only to UI-facing changes"
+PATH="$TEST_ROOT/fake-bin:$PATH" \
+SERGEANT_CONFIG="$TEST_ROOT/config" \
+SERGEANT_FLEET="$TEST_ROOT/fleet" \
+SGT_WIKI_DISABLED=1 \
+  "$ROOT_DIR/bin/sgt-dispatch" test "$policy_mission" --repos app >/dev/null
+brief="$(grep -rl "^${policy_mission}$" "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
+assert_not_contains "Accessibility axis"
+
+write_routing_config "Backend service" "product" "Internal services" "Maintain deployment automation"
+wrapped_policy_mission="Document wrapped backend review policy:
+accessibility review applies
+  only to UI-facing changes"
+PATH="$TEST_ROOT/fake-bin:$PATH" \
+SERGEANT_CONFIG="$TEST_ROOT/config" \
+SERGEANT_FLEET="$TEST_ROOT/fleet" \
+SGT_WIKI_DISABLED=1 \
+  "$ROOT_DIR/bin/sgt-dispatch" test "$wrapped_policy_mission" --repos app >/dev/null
+brief="$(grep -rlF "Document wrapped backend review policy:" "$TEST_ROOT"/app-sgt-*/.sergeant-brief.md)"
+[[ -n "$brief" ]] || { printf 'wrapped policy brief was not generated\n' >&2; exit 1; }
 assert_not_contains "Accessibility axis"
 
 for repo_name in role-ui group-ui; do

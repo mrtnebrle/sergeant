@@ -38,6 +38,15 @@ require_file "docs/getting-started.md"
 require_file "docs/skills.md"
 require_file "docs/using-sergeant.md"
 require_file "docs/troubleshooting.md"
+for policy_file in AGENTS.md skills/dispatch/SKILL.md README.md docs/using-sergeant.md bin/sgt-dispatch; do
+  require_text "$policy_file" 'review_level=medium'
+  require_text "$policy_file" "at most one repository-required full suite"
+  require_text "$policy_file" "one bounded independent review pass"
+  require_text "$policy_file" "rerun only affected tests and review checks"
+done
+reject_text "AGENTS.md" "All future generated worker briefs encode"
+# shellcheck disable=SC2016
+require_text "AGENTS.md" '`tests/sgt-dispatch-brief-test.sh` must fail when this output omits it'
 require_text "docs/getting-started.md" "for agent in opencode goose claude"
 require_text "docs/getting-started.md" "Install OpenCode, Goose, or Claude before using Sergeant interactive dispatch."
 
@@ -51,6 +60,7 @@ require_text "AGENTS.md" ".sergeant-intent.md"
 require_text "AGENTS.md" "same canonical intent revision"
 require_text "AGENTS.md" "td context <id> --work-dir <owning-repo-path>"
 require_text "AGENTS.md" "ingest, backfill, regenerate, inspect, update, or change the wiki"
+# shellcheck disable=SC2016
 require_text "AGENTS.md" 'Sergeant-owned procedural skills live at `skills/<name>/SKILL.md`'
 require_text "AGENTS.md" "read that repository-local file directly"
 require_text "AGENTS.md" "takes precedence over any same-named registry skill"
@@ -78,7 +88,23 @@ require_text "skills/dispatch/SKILL.md" '--intent-file <path>'
 require_text "skills/dispatch/SKILL.md" "standard-isolated"
 require_text "skills/dispatch/SKILL.md" "auth, OAuth, security, secret, credential, payment, database, migration, stateful, production, destructive"
 require_text "skills/dispatch/SKILL.md" "mutation before validation"
-require_text "skills/dispatch/SKILL.md" "After two remediation cycles"
+reject_text "skills/dispatch/SKILL.md" "After two remediation cycles"
+reject_text "skills/dispatch/SKILL.md" "rerun affected tests and all required axes"
+require_text "skills/dispatch/SKILL.md" "findings with the same originating run, head, owning module, and root cause share one serialized remediation worker and branch"
+require_text "skills/dispatch/SKILL.md" "If remediation reaches a second cycle, stop fix dispatch and require architectural/root-cause review plus a human decision"
+grouped_remediation_count="$(grep -Fc 'Before merging grouped remediation' "$repo_root/skills/dispatch/SKILL.md" || true)"
+[[ "$grouped_remediation_count" == "1" ]] || \
+  fail "skills/dispatch/SKILL.md must define exactly one grouped remediation rereview contract"
+grouped_remediation_policy="$(grep -F 'Before merging grouped remediation' "$repo_root/skills/dispatch/SKILL.md" || true)"
+case "$grouped_remediation_policy" in
+  *"rerun only affected native tests and independent review checks"*"risk review only when active repository or task policy explicitly requires it"*) ;;
+  *) fail "skills/dispatch/SKILL.md grouped remediation must keep rereviews affected-only and risk review policy-conditional" ;;
+esac
+for readiness_contract_file in bin/sgt-dispatch bin/sgt-validate docs/using-sergeant.md; do
+  require_text "$readiness_contract_file" "bounded Standards/Spec review pass"
+  require_text "$readiness_contract_file" "does not attest that an unconditional standalone readiness-risk review ran"
+done
+require_text "bin/sgt-validate" '_ready_field readiness_review'
 require_text "docs/using-sergeant.md" '--intent-file intent.md'
 require_text "docs/using-sergeant.md" ".sergeant-intent.md"
 reject_text "AGENTS.md" 'no-mistakes axi run --intent "<the user'
