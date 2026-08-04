@@ -26,11 +26,16 @@ case "$1" in
   create) [[ "${2:-}" != "--help" ]] || { printf 'Usage: td create ... --description <text> --json --work-dir <path>\n'; exit 0; } ;;
 esac
 printf '%s\n' "$*" >> "$TD_LOG"
+if [[ "$1" == "list" && "${TD_REPLACE_RETRY_ON_LIST:-0}" == "1" && ! -e "$RETRY_REPLACED_MARKER" ]]; then
+  printf '{"findings":[]}\n' > "$RETRY_PATH.tmp"
+  /bin/mv "$RETRY_PATH.tmp" "$RETRY_PATH"
+  touch "$RETRY_REPLACED_MARKER"
+fi
 case "$1" in
   list) printf '%s\n' "${TD_LIST_RESULT:-[]}" ;;
   create)
-    [[ "${TD_FAIL_CREATE:-0}" != "1" ]] || exit 23
     count="$(wc -l < "$TD_IDS")"
+    [[ "${TD_FAIL_CREATE:-0}" != "1" && "${TD_FAIL_CREATE_AT:-0}" != "$((count + 1))" ]] || exit 23
     printf '{"id":"td-created-%s"}\n' "$((count + 1))"
     printf 'td-created-%s\n' "$((count + 1))" >> "$TD_IDS"
     ;;
@@ -54,7 +59,8 @@ chmod +x "$TEST_ROOT/fake-bin/yq"
 cat > "$TEST_ROOT/fake-bin/mv" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$(basename "$2")" >> "$MV_LOG"
-exec /usr/bin/mv "$@"
+PATH=/usr/bin:/bin
+exec mv "$@"
 EOF
 chmod +x "$TEST_ROOT/fake-bin/mv"
 
@@ -75,7 +81,8 @@ chmod +x "$INSTALLED_BIN/sgt-notify"
 
 cat > "$TEST_ROOT/fake-bin/cat" <<'EOF'
 #!/usr/bin/env bash
-exec /usr/bin/cat "$@"
+PATH=/usr/bin:/bin
+exec cat "$@"
 EOF
 chmod +x "$TEST_ROOT/fake-bin/cat"
 
@@ -114,14 +121,19 @@ run_router() {
   : > "$TEST_ROOT/notify.log"
   : > "$TEST_ROOT/mv.log"
   if [[ "${PRESERVE_FLEET:-0}" != "1" ]]; then
-    rm -f "$WORKTREE"/.sergeant-{status,message,gate-generation,review-gates.lock}
-    rm -rf "$WORKTREE/.sergeant-review-gates"
+    rm -f "$WORKTREE"/.sergeant-{status,message,gate-generation,review-gates.lock,review-retries.lock}
+    rm -f "$WORKTREE"/.sergeant-review-retry.*
+    rm -rf "$WORKTREE/.sergeant-review-gates" "$WORKTREE/.sergeant-review-retries"
   fi
   set +e
   output="$(PATH="$TEST_ROOT/fake-bin:$PATH" \
     REPO_PATH="$REPO" TD_LOG="$TEST_ROOT/td.log" TD_IDS="$TEST_ROOT/td-ids" \
     NOTIFY_LOG="$TEST_ROOT/notify.log" MV_LOG="$TEST_ROOT/mv.log" ROUTER_WORKTREE="$WORKTREE" SERGEANT_CONFIG="$TEST_ROOT/config" \
     TD_LIST_RESULT="${TD_LIST_RESULT:-[]}" TD_FAIL_CREATE="${TD_FAIL_CREATE:-0}" \
+    TD_FAIL_CREATE_AT="${TD_FAIL_CREATE_AT:-0}" \
+    TD_REPLACE_RETRY_ON_LIST="${TD_REPLACE_RETRY_ON_LIST:-0}" \
+    RETRY_PATH="${RETRY_PATH:-$WORKTREE/.sergeant-review-retries/standards-code-review.json}" \
+    RETRY_REPLACED_MARKER="${RETRY_REPLACED_MARKER:-$TEST_ROOT/retry-replaced}" \
     "$INSTALLED_BIN/sgt-review-findings" test app \
       --input "$1" --axis "${ROUTER_AXIS:-standards}" --source code-review \
       --branch fix/review --head-sha abc1234 --parent-task td-parent \
@@ -163,6 +175,33 @@ generation_line="$(grep -nF '.sergeant-gate-generation' "$TEST_ROOT/mv.log" | cu
 message_line="$(grep -nF '.sergeant-message' "$TEST_ROOT/mv.log" | cut -d: -f1)"
 status_line="$(grep -nF '.sergeant-status' "$TEST_ROOT/mv.log" | cut -d: -f1)"
 [[ "$generation_line" -lt "$message_line" && "$message_line" -lt "$status_line" ]]
+
+ROUTER_AXIS=readiness run_router "$TEST_ROOT/findings.json"
+[[ "$status" -eq 2 && "$output" != *'invalid review axis'* ]] || {
+  printf 'readiness axis was not routed: status=%s output=%s\n' "$status" "$output" >&2
+  exit 1
+}
+grep -Fq 'Review axis: readiness' "$TEST_ROOT/td.log"
+grep -Fq 'independent-review-finding:app:readiness:code-review:std-1' "$TEST_ROOT/td.log"
+
+cat > "$TEST_ROOT/common-severities.json" <<'EOF'
+{"findings":[
+  {"id":"severity-high","severity":"high","disposition":"actionable","summary":"High severity","evidence":"high evidence","paths":[],"acceptance_criteria":"Resolve high finding","recommendation":"Fix high finding"},
+  {"id":"severity-medium","severity":"medium","disposition":"actionable","summary":"Medium severity","evidence":"medium evidence","paths":[],"acceptance_criteria":"Resolve medium finding","recommendation":"Fix medium finding"},
+  {"id":"severity-low","severity":"low","disposition":"actionable","summary":"Low severity","evidence":"low evidence","paths":[],"acceptance_criteria":"Resolve low finding","recommendation":"Fix low finding"}
+]}
+EOF
+ROUTER_AXIS=readiness run_router "$TEST_ROOT/common-severities.json"
+[[ "$status" -eq 2 && "$output" != *'invalid review output'* ]] || {
+  printf 'common severities were not normalized: status=%s output=%s\n' "$status" "$output" >&2
+  exit 1
+}
+grep -Fq -- '--priority P1' "$TEST_ROOT/td.log"
+grep -Fq -- '--priority P2' "$TEST_ROOT/td.log"
+grep -Fq -- '--priority P3' "$TEST_ROOT/td.log"
+grep -Fq 'Severity: error' "$TEST_ROOT/td.log"
+grep -Fq 'Severity: warning' "$TEST_ROOT/td.log"
+grep -Fq 'Severity: info' "$TEST_ROOT/td.log"
 
 cat > "$TEST_ROOT/secrets.json" <<'EOF'
 {"findings":[{"id":"std-secret","severity":"warning","disposition":"actionable","summary":"Credential exposure","evidence":"token=super-secret Bearer raw-token Basic dXNlcjpwYXNz ghp_123456789012345678901234567890123456 AKIAIOSFODNN7EXAMPLE https://user:pass@example.test -----BEGIN PRIVATE KEY-----","paths":["bin/run"],"acceptance_criteria":"Redact credential=hidden-value","recommendation":"Remove password=hunter2"}]}
@@ -308,6 +347,58 @@ TD_FAIL_CREATE=1 run_router "$TEST_ROOT/findings.json"
 [[ "$status" -eq 2 && "$output" == *'failed to create td task'* ]]
 [[ "$(cat "$WORKTREE/.sergeant-status")" == 'blocked' ]]
 grep -Fq 'Review finding routing failed' "$WORKTREE/.sergeant-message"
+
+TD_FAIL_CREATE=1 run_router "$TEST_ROOT/secrets.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+[[ -f "$retry_path" ]] || {
+  printf 'downstream failure did not retain retry artifact\n' >&2
+  exit 1
+}
+[[ "$output" == *"$retry_path"* ]]
+grep -Fq "$retry_path" "$WORKTREE/.sergeant-message"
+grep -Fq 'token=[REDACTED]' "$retry_path"
+grep -Fq 'Bearer [REDACTED]' "$retry_path"
+grep -Fq 'credential=[REDACTED]' "$retry_path"
+grep -Fq 'password=[REDACTED]' "$retry_path"
+grep -Fq 'standards-code-review.json' "$TEST_ROOT/mv.log"
+if grep -Eq 'super-secret|raw-token|hidden-value|hunter2|dXNlcjpwYXNz|ghp_|AKIA|user:pass|BEGIN PRIVATE KEY' "$retry_path"; then
+  printf 'review secrets entered retry artifact\n' >&2
+  exit 1
+fi
+
+cat > "$TEST_ROOT/retry-findings.json" <<'EOF'
+{"findings":[
+  {"id":"retry-one","severity":"warning","disposition":"actionable","summary":"First retry finding","evidence":"first evidence","paths":[],"acceptance_criteria":"Route first finding","recommendation":"Fix first finding"},
+  {"id":"retry-two","severity":"warning","disposition":"actionable","summary":"Second retry finding","evidence":"second evidence","paths":[],"acceptance_criteria":"Route second finding","recommendation":"Fix second finding"}
+]}
+EOF
+TD_FAIL_CREATE_AT=2 run_router "$TEST_ROOT/retry-findings.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+[[ "$status" -eq 2 && -f "$retry_path" ]]
+[[ "$(grep -c '^create ' "$TEST_ROOT/td.log")" -eq 2 ]]
+
+TD_LIST_RESULT='[{"id":"td-existing","status":"in_progress","description":"Deduplication key: independent-review-finding:app:standards:code-review:retry-one"}]' \
+  PRESERVE_FLEET=1 run_router "$retry_path"
+[[ "$status" -eq 0 ]]
+grep -Fq 'update td-existing' "$TEST_ROOT/td.log"
+[[ "$(grep -c '^create ' "$TEST_ROOT/td.log")" -eq 1 ]]
+[[ ! -e "$retry_path" ]] || {
+  printf 'successful retry did not consume retry artifact\n' >&2
+  exit 1
+}
+[[ "$(cat "$WORKTREE/.sergeant-status")" == 'in_progress' ]]
+[[ ! -e "$WORKTREE/.sergeant-message" ]]
+
+rm -f "$TEST_ROOT/retry-replaced"
+TD_FAIL_CREATE_AT=2 run_router "$TEST_ROOT/retry-findings.json"
+retry_path="$WORKTREE/.sergeant-review-retries/standards-code-review.json"
+TD_LIST_RESULT='[{"id":"td-existing","status":"in_progress","description":"Deduplication key: independent-review-finding:app:standards:code-review:retry-one"}]' \
+  TD_REPLACE_RETRY_ON_LIST=1 PRESERVE_FLEET=1 run_router "$retry_path"
+[[ "$status" -eq 0 ]]
+grep -Fxq '{"findings":[]}' "$retry_path" || {
+  printf 'successful retry removed a newer retry artifact\n' >&2
+  exit 1
+}
 
 # Missing prerequisite tool (yq absent) must publish blocked state
 mkdir -p "$TEST_ROOT/no-yq-bin"

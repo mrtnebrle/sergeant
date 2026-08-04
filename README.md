@@ -210,11 +210,11 @@ profile; workers and remediation loops do not repeat it.
 
 ### Independent review findings
 
-Dispatched workers pass each Standards, Spec, or accessibility review's strict JSON finding artifact to `sgt-review-findings`. The router creates or updates one owning-repository td task per actionable finding, preserves active task state on reruns, and publishes blocking task IDs and remediation guidance through `.sergeant-message`, `.sergeant-status`, and `sgt-notify`. Cosmetic and false-positive dispositions create no cards. The schema rejects free-form review bodies, and credential-shaped values in accepted fields are redacted before durable storage.
+Dispatched workers pass each Standards, Spec, accessibility, or readiness review's strict JSON finding artifact to `sgt-review-findings`. The router accepts `error`, `warning`, `info`, and `informational`; it normalizes `high`, `medium`, and `low` to `error`, `warning`, and `info` before applying the existing P1, P2, and P3 semantics.
 
-### Independent review findings
+The router creates or updates one owning-repository td task per actionable finding, preserves active task state on reruns, and publishes blocking task IDs and remediation guidance through `.sergeant-message`, `.sergeant-status`, and `sgt-notify`. Cosmetic and false-positive dispositions create no cards. The schema rejects free-form review bodies, and credential-shaped values in accepted fields are redacted before durable storage.
 
-Dispatched workers pass each Standards, Spec, or accessibility review's strict JSON finding artifact to `sgt-review-findings`. The router creates or updates one owning-repository td task per actionable finding, preserves active task state on reruns, and publishes blocking task IDs and remediation guidance through `.sergeant-message`, `.sergeant-status`, and `sgt-notify`. Cosmetic and false-positive dispositions create no cards. The schema rejects free-form review bodies, and credential-shaped values in accepted fields are redacted before durable storage.
+When downstream routing fails after sanitization, the router atomically writes `.sergeant-review-retries/<axis>-<source>.json` inside the worker worktree and reports its full path. Retry with the same command and use that path for `--input`. Existing deduplication keys prevent duplicate tasks; a successful retry consumes the artifact, while a newer failure atomically supersedes it.
 
 ## Skills
 
